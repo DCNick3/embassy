@@ -1,3 +1,5 @@
 [submodule "stm32-data"]
 	path = stm32-data
 	url = https://github.com/embassy-rs/stm32-data.git
+[submodule "stm32-data/"]
+	url = git@github.com:DCNick3/stm32-data.git
