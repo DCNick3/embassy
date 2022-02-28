@@ -9,7 +9,6 @@ use embassy::executor::Spawner;
 use embassy_stm32::dma::NoDma;
 use embassy_stm32::usart::{Config, Uart};
 use embassy_stm32::Peripherals;
-use embedded_hal::blocking::serial::Write;
 use example_common::*;
 
 #[embassy::main(config = "config()")]
@@ -24,6 +23,8 @@ async fn main(_spawner: Spawner, p: Peripherals) {
 
     // Arduino pins D0 and D1
     // They're connected together with a 1K resistor.
+    #[cfg(feature = "stm32f103c8")]
+    let (tx, rx, usart) = (p.PA9, p.PA10, p.USART1);
     #[cfg(feature = "stm32g491re")]
     let (tx, rx, usart) = (p.PC4, p.PC5, p.USART1);
     #[cfg(feature = "stm32g071rb")]
@@ -42,10 +43,10 @@ async fn main(_spawner: Spawner, p: Peripherals) {
     // This is because we aren't sending+receiving at the same time.
 
     let data = [0xC0, 0xDE];
-    usart.bwrite_all(&data).unwrap();
+    usart.blocking_write(&data).unwrap();
 
     let mut buf = [0; 2];
-    usart.read_blocking(&mut buf).unwrap();
+    usart.blocking_read(&mut buf).unwrap();
     assert_eq!(buf, data);
 
     info!("Test OK");

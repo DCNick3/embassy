@@ -2,28 +2,33 @@ use core::marker::PhantomData;
 
 use embassy::util::Unborrow;
 use embassy_hal_common::unborrow;
-use embedded_hal::blocking::spi as eh;
-use embedded_hal::spi as ehnb;
 
 use crate::gpio::sealed::Pin as _;
-use crate::gpio::{NoPin, OptionalPin};
+use crate::gpio::{AnyPin, Pin as GpioPin};
 use crate::{pac, peripherals};
 
-pub use ehnb::{Phase, Polarity};
+pub use embedded_hal_02::spi::{Phase, Polarity};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub enum Error {
+    // No errors for now
+}
 
 #[non_exhaustive]
 pub struct Config {
     pub frequency: u32,
-    pub phase: ehnb::Phase,
-    pub polarity: ehnb::Polarity,
+    pub phase: Phase,
+    pub polarity: Polarity,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             frequency: 1_000_000,
-            phase: ehnb::Phase::CaptureOnFirstTransition,
-            polarity: ehnb::Polarity::IdleLow,
+            phase: Phase::CaptureOnFirstTransition,
+            polarity: Polarity::IdleLow,
         }
     }
 }
@@ -62,14 +67,66 @@ fn calc_prescs(freq: u32) -> (u8, u8) {
 
 impl<'d, T: Instance> Spi<'d, T> {
     pub fn new(
-        inner: impl Unborrow<Target = T>,
-        clk: impl Unborrow<Target = impl ClkPin<T>>,
-        mosi: impl Unborrow<Target = impl MosiPin<T>>,
-        miso: impl Unborrow<Target = impl MisoPin<T>>,
-        cs: impl Unborrow<Target = impl CsPin<T>>,
+        inner: impl Unborrow<Target = T> + 'd,
+        clk: impl Unborrow<Target = impl ClkPin<T>> + 'd,
+        mosi: impl Unborrow<Target = impl MosiPin<T>> + 'd,
+        miso: impl Unborrow<Target = impl MisoPin<T>> + 'd,
         config: Config,
     ) -> Self {
-        unborrow!(inner, clk, mosi, miso, cs);
+        unborrow!(clk, mosi, miso);
+        Self::new_inner(
+            inner,
+            Some(clk.degrade()),
+            Some(mosi.degrade()),
+            Some(miso.degrade()),
+            None,
+            config,
+        )
+    }
+
+    pub fn new_txonly(
+        inner: impl Unborrow<Target = T> + 'd,
+        clk: impl Unborrow<Target = impl ClkPin<T>> + 'd,
+        mosi: impl Unborrow<Target = impl MosiPin<T>> + 'd,
+        config: Config,
+    ) -> Self {
+        unborrow!(clk, mosi);
+        Self::new_inner(
+            inner,
+            Some(clk.degrade()),
+            Some(mosi.degrade()),
+            None,
+            None,
+            config,
+        )
+    }
+
+    pub fn new_rxonly(
+        inner: impl Unborrow<Target = T> + 'd,
+        clk: impl Unborrow<Target = impl ClkPin<T>> + 'd,
+        miso: impl Unborrow<Target = impl MisoPin<T>> + 'd,
+        config: Config,
+    ) -> Self {
+        unborrow!(clk, miso);
+        Self::new_inner(
+            inner,
+            Some(clk.degrade()),
+            None,
+            Some(miso.degrade()),
+            None,
+            config,
+        )
+    }
+
+    fn new_inner(
+        inner: impl Unborrow<Target = T> + 'd,
+        clk: Option<AnyPin>,
+        mosi: Option<AnyPin>,
+        miso: Option<AnyPin>,
+        cs: Option<AnyPin>,
+        config: Config,
+    ) -> Self {
+        unborrow!(inner);
 
         unsafe {
             let p = inner.regs();
@@ -78,24 +135,24 @@ impl<'d, T: Instance> Spi<'d, T> {
             p.cpsr().write(|w| w.set_cpsdvsr(presc));
             p.cr0().write(|w| {
                 w.set_dss(0b0111); // 8bit
-                w.set_spo(config.polarity == ehnb::Polarity::IdleHigh);
-                w.set_sph(config.phase == ehnb::Phase::CaptureOnSecondTransition);
+                w.set_spo(config.polarity == Polarity::IdleHigh);
+                w.set_sph(config.phase == Phase::CaptureOnSecondTransition);
                 w.set_scr(postdiv);
             });
             p.cr1().write(|w| {
                 w.set_sse(true); // enable
             });
 
-            if let Some(pin) = clk.pin_mut() {
+            if let Some(pin) = &clk {
                 pin.io().ctrl().write(|w| w.set_funcsel(1));
             }
-            if let Some(pin) = mosi.pin_mut() {
+            if let Some(pin) = &mosi {
                 pin.io().ctrl().write(|w| w.set_funcsel(1));
             }
-            if let Some(pin) = miso.pin_mut() {
+            if let Some(pin) = &miso {
                 pin.io().ctrl().write(|w| w.set_funcsel(1));
             }
-            if let Some(pin) = cs.pin_mut() {
+            if let Some(pin) = &cs {
                 pin.io().ctrl().write(|w| w.set_funcsel(1));
             }
         }
@@ -105,7 +162,7 @@ impl<'d, T: Instance> Spi<'d, T> {
         }
     }
 
-    pub fn write(&mut self, data: &[u8]) {
+    pub fn blocking_write(&mut self, data: &[u8]) -> Result<(), Error> {
         unsafe {
             let p = self.inner.regs();
             for &b in data {
@@ -114,11 +171,12 @@ impl<'d, T: Instance> Spi<'d, T> {
                 while !p.sr().read().rne() {}
                 let _ = p.dr().read();
             }
-            self.flush();
         }
+        self.flush()?;
+        Ok(())
     }
 
-    pub fn transfer(&mut self, data: &mut [u8]) {
+    pub fn blocking_transfer_in_place(&mut self, data: &mut [u8]) -> Result<(), Error> {
         unsafe {
             let p = self.inner.regs();
             for b in data {
@@ -127,15 +185,50 @@ impl<'d, T: Instance> Spi<'d, T> {
                 while !p.sr().read().rne() {}
                 *b = p.dr().read().data() as u8;
             }
-            self.flush();
         }
+        self.flush()?;
+        Ok(())
     }
 
-    pub fn flush(&mut self) {
+    pub fn blocking_read(&mut self, data: &mut [u8]) -> Result<(), Error> {
+        unsafe {
+            let p = self.inner.regs();
+            for b in data {
+                while !p.sr().read().tnf() {}
+                p.dr().write(|w| w.set_data(0));
+                while !p.sr().read().rne() {}
+                *b = p.dr().read().data() as u8;
+            }
+        }
+        self.flush()?;
+        Ok(())
+    }
+
+    pub fn blocking_transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Error> {
+        unsafe {
+            let p = self.inner.regs();
+            let len = read.len().max(write.len());
+            for i in 0..len {
+                let wb = write.get(i).copied().unwrap_or(0);
+                while !p.sr().read().tnf() {}
+                p.dr().write(|w| w.set_data(wb as _));
+                while !p.sr().read().rne() {}
+                let rb = p.dr().read().data() as u8;
+                if let Some(r) = read.get_mut(i) {
+                    *r = rb;
+                }
+            }
+        }
+        self.flush()?;
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<(), Error> {
         unsafe {
             let p = self.inner.regs();
             while p.sr().read().bsy() {}
         }
+        Ok(())
     }
 
     pub fn set_frequency(&mut self, freq: u32) {
@@ -157,33 +250,12 @@ impl<'d, T: Instance> Spi<'d, T> {
     }
 }
 
-impl<'d, T: Instance> eh::Write<u8> for Spi<'d, T> {
-    type Error = core::convert::Infallible;
-
-    fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
-        self.write(words);
-        Ok(())
-    }
-}
-
-impl<'d, T: Instance> eh::Transfer<u8> for Spi<'d, T> {
-    type Error = core::convert::Infallible;
-    fn transfer<'w>(&mut self, words: &'w mut [u8]) -> Result<&'w [u8], Self::Error> {
-        self.transfer(words);
-        Ok(words)
-    }
-}
-
 mod sealed {
     use super::*;
 
     pub trait Instance {
         fn regs(&self) -> pac::spi::Spi;
     }
-    pub trait ClkPin<T: Instance> {}
-    pub trait CsPin<T: Instance> {}
-    pub trait MosiPin<T: Instance> {}
-    pub trait MisoPin<T: Instance> {}
 }
 
 pub trait Instance: sealed::Instance {}
@@ -202,23 +274,13 @@ macro_rules! impl_instance {
 impl_instance!(SPI0, Spi0);
 impl_instance!(SPI1, Spi1);
 
-pub trait ClkPin<T: Instance>: sealed::ClkPin<T> + OptionalPin {}
-pub trait CsPin<T: Instance>: sealed::CsPin<T> + OptionalPin {}
-pub trait MosiPin<T: Instance>: sealed::MosiPin<T> + OptionalPin {}
-pub trait MisoPin<T: Instance>: sealed::MisoPin<T> + OptionalPin {}
-
-impl<T: Instance> sealed::ClkPin<T> for NoPin {}
-impl<T: Instance> ClkPin<T> for NoPin {}
-impl<T: Instance> sealed::CsPin<T> for NoPin {}
-impl<T: Instance> CsPin<T> for NoPin {}
-impl<T: Instance> sealed::MosiPin<T> for NoPin {}
-impl<T: Instance> MosiPin<T> for NoPin {}
-impl<T: Instance> sealed::MisoPin<T> for NoPin {}
-impl<T: Instance> MisoPin<T> for NoPin {}
+pub trait ClkPin<T: Instance>: GpioPin {}
+pub trait CsPin<T: Instance>: GpioPin {}
+pub trait MosiPin<T: Instance>: GpioPin {}
+pub trait MisoPin<T: Instance>: GpioPin {}
 
 macro_rules! impl_pin {
     ($pin:ident, $instance:ident, $function:ident) => {
-        impl sealed::$function<peripherals::$instance> for peripherals::$pin {}
         impl $function<peripherals::$instance> for peripherals::$pin {}
     };
 }
@@ -243,3 +305,102 @@ impl_pin!(PIN_16, SPI0, MisoPin);
 impl_pin!(PIN_17, SPI0, CsPin);
 impl_pin!(PIN_18, SPI0, ClkPin);
 impl_pin!(PIN_19, SPI0, MosiPin);
+
+// ====================
+
+mod eh02 {
+    use super::*;
+
+    impl<'d, T: Instance> embedded_hal_02::blocking::spi::Transfer<u8> for Spi<'d, T> {
+        type Error = Error;
+        fn transfer<'w>(&mut self, words: &'w mut [u8]) -> Result<&'w [u8], Self::Error> {
+            self.blocking_transfer_in_place(words)?;
+            Ok(words)
+        }
+    }
+
+    impl<'d, T: Instance> embedded_hal_02::blocking::spi::Write<u8> for Spi<'d, T> {
+        type Error = Error;
+
+        fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
+            self.blocking_write(words)
+        }
+    }
+}
+
+#[cfg(feature = "unstable-traits")]
+mod eh1 {
+    use super::*;
+
+    impl embedded_hal_1::spi::Error for Error {
+        fn kind(&self) -> embedded_hal_1::spi::ErrorKind {
+            match *self {}
+        }
+    }
+
+    impl<'d, T: Instance> embedded_hal_1::spi::ErrorType for Spi<'d, T> {
+        type Error = Error;
+    }
+
+    impl<'d, T: Instance> embedded_hal_1::spi::blocking::Read<u8> for Spi<'d, T> {
+        fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+            self.blocking_transfer(words, &[])
+        }
+
+        fn read_transaction(&mut self, words: &mut [&mut [u8]]) -> Result<(), Self::Error> {
+            for buf in words {
+                self.blocking_read(buf)?
+            }
+            Ok(())
+        }
+    }
+
+    impl<'d, T: Instance> embedded_hal_1::spi::blocking::Write<u8> for Spi<'d, T> {
+        fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
+            self.blocking_write(words)
+        }
+
+        fn write_transaction(&mut self, words: &[&[u8]]) -> Result<(), Self::Error> {
+            for buf in words {
+                self.blocking_write(buf)?
+            }
+            Ok(())
+        }
+
+        fn write_iter<WI>(&mut self, words: WI) -> Result<(), Self::Error>
+        where
+            WI: IntoIterator<Item = u8>,
+        {
+            for w in words {
+                self.blocking_write(&[w])?;
+            }
+            Ok(())
+        }
+    }
+
+    impl<'d, T: Instance> embedded_hal_1::spi::blocking::ReadWrite<u8> for Spi<'d, T> {
+        fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
+            self.blocking_transfer(read, write)
+        }
+
+        fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+            self.blocking_transfer_in_place(words)
+        }
+
+        fn transaction<'a>(
+            &mut self,
+            operations: &mut [embedded_hal_1::spi::blocking::Operation<'a, u8>],
+        ) -> Result<(), Self::Error> {
+            use embedded_hal_1::spi::blocking::Operation;
+            for o in operations {
+                match o {
+                    Operation::Read(b) => self.blocking_read(b)?,
+                    Operation::Write(b) => self.blocking_write(b)?,
+                    Operation::Transfer(r, w) => self.blocking_transfer(r, w)?,
+                    Operation::TransferInPlace(b) => self.blocking_transfer_in_place(b)?,
+                }
+            }
+            Ok(())
+        }
+    }
+}

@@ -4,14 +4,13 @@
 
 use embassy::executor::Spawner;
 use embassy::time::{Duration, Timer};
-use embassy_stm32::dcmi::*;
-use embassy_stm32::gpio::{Level, NoPin, Output, Speed};
+use embassy_stm32::dcmi::{self, *};
+use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::i2c::I2c;
 use embassy_stm32::interrupt;
 use embassy_stm32::rcc::{Mco, Mco1Source, McoClock};
 use embassy_stm32::time::U32Ext;
 use embassy_stm32::Peripherals;
-use embedded_hal::digital::v2::OutputPin;
 
 use defmt_rtt as _; // global logger
 use panic_probe as _;
@@ -34,8 +33,6 @@ pub fn config() -> Config {
     config.rcc.sys_ck = Some(400.mhz().into());
     config.rcc.hclk = Some(400.mhz().into());
     config.rcc.pll1.q_ck = Some(100.mhz().into());
-    config.rcc.enable_dma1 = true;
-    config.rcc.enable_dma2 = true;
     config.rcc.pclk1 = Some(100.mhz().into());
     config.rcc.pclk2 = Some(100.mhz().into());
     config.rcc.pclk3 = Some(100.mhz().into());
@@ -81,31 +78,10 @@ async fn main(_spawner: Spawner, p: Peripherals) {
     );
 
     let dcmi_irq = interrupt::take!(DCMI);
-    let mut dcmi = Dcmi::new(
-        p.DCMI,
-        p.DMA1_CH0,
-        VSyncDataInvalidLevel::High,
-        HSyncDataInvalidLevel::Low,
-        PixelClockPolarity::RisingEdge,
-        false,
-        dcmi_irq,
-        p.PC6,
-        p.PC7,
-        p.PE0,
-        p.PE1,
-        p.PE4,
-        p.PD3,
-        p.PE5,
-        p.PE6,
-        NoPin,
-        NoPin,
-        NoPin,
-        NoPin,
-        NoPin,
-        NoPin,
-        p.PB7,
-        p.PA4,
-        p.PA6,
+    let config = dcmi::Config::default();
+    let mut dcmi = Dcmi::new_8bit(
+        p.DCMI, p.DMA1_CH0, dcmi_irq, p.PC6, p.PC7, p.PE0, p.PE1, p.PE4, p.PD3, p.PE5, p.PE6,
+        p.PB7, p.PA4, p.PA6, config,
     );
 
     defmt::info!("attempting capture");
@@ -116,11 +92,11 @@ async fn main(_spawner: Spawner, p: Peripherals) {
     defmt::info!("main loop running");
     loop {
         defmt::info!("high");
-        defmt::unwrap!(led.set_high());
+        led.set_high();
         Timer::after(Duration::from_millis(500)).await;
 
         defmt::info!("low");
-        defmt::unwrap!(led.set_low());
+        led.set_low();
         Timer::after(Duration::from_millis(500)).await;
     }
 }
@@ -131,7 +107,7 @@ mod ov7725 {
     use defmt::Format;
     use embassy::time::{Duration, Timer};
     use embassy_stm32::rcc::{Mco, McoInstance};
-    use embassy_traits::i2c::I2c;
+    use embedded_hal_async::i2c::I2c;
 
     #[repr(u8)]
     pub enum RgbFormat {

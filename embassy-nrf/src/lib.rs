@@ -1,6 +1,8 @@
 #![no_std]
-#![feature(generic_associated_types)]
-#![feature(type_alias_impl_trait)]
+#![cfg_attr(
+    feature = "nightly",
+    feature(generic_associated_types, type_alias_impl_trait)
+)]
 
 #[cfg(not(any(
     feature = "nrf51",
@@ -47,6 +49,13 @@ pub mod temp;
 pub mod timer;
 pub mod twim;
 pub mod uarte;
+#[cfg(any(
+    feature = "_nrf5340-app",
+    feature = "nrf52820",
+    feature = "nrf52833",
+    feature = "nrf52840"
+))]
+pub mod usb;
 #[cfg(not(feature = "_nrf5340"))]
 pub mod wdt;
 

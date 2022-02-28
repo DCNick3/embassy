@@ -4,19 +4,17 @@
 
 #[path = "../example_common.rs"]
 mod example_common;
-use embassy::blocking_mutex::kind::Noop;
+use example_common::*;
+
+use embassy::blocking_mutex::raw::NoopRawMutex;
 use embassy::channel::mpsc::{self, Channel, Sender};
+use embassy::executor::Spawner;
 use embassy::util::Forever;
 use embassy_nrf::peripherals::UARTE0;
 use embassy_nrf::uarte::UarteRx;
-use example_common::*;
-
-use embassy::executor::Spawner;
-use embassy::traits::uart::{Read, Write};
-use embassy_nrf::gpio::NoPin;
 use embassy_nrf::{interrupt, uarte, Peripherals};
 
-static CHANNEL: Forever<Channel<Noop, [u8; 8], 1>> = Forever::new();
+static CHANNEL: Forever<Channel<NoopRawMutex, [u8; 8], 1>> = Forever::new();
 
 #[embassy::main]
 async fn main(spawner: Spawner, p: Peripherals) {
@@ -25,7 +23,7 @@ async fn main(spawner: Spawner, p: Peripherals) {
     config.baudrate = uarte::Baudrate::BAUD115200;
 
     let irq = interrupt::take!(UARTE0_UART0);
-    let uart = uarte::Uarte::new(p.UARTE0, irq, p.P0_08, p.P0_06, NoPin, NoPin, config);
+    let uart = uarte::Uarte::new(p.UARTE0, irq, p.P0_08, p.P0_06, config);
     let (mut tx, rx) = uart.split();
 
     let c = CHANNEL.put(Channel::new());
@@ -58,7 +56,7 @@ async fn main(spawner: Spawner, p: Peripherals) {
 }
 
 #[embassy::task]
-async fn reader(mut rx: UarteRx<'static, UARTE0>, s: Sender<'static, Noop, [u8; 8], 1>) {
+async fn reader(mut rx: UarteRx<'static, UARTE0>, s: Sender<'static, NoopRawMutex, [u8; 8], 1>) {
     let mut buf = [0; 8];
     loop {
         info!("reading...");

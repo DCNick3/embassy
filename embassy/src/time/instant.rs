@@ -1,7 +1,7 @@
 use core::fmt;
 use core::ops::{Add, AddAssign, Sub, SubAssign};
 
-use super::{driver, Duration, TICKS_PER_SECOND};
+use super::{driver, Duration, GCD_1K, GCD_1M, TICKS_PER_SECOND};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -28,10 +28,17 @@ impl Instant {
         Self { ticks }
     }
 
+    /// Create an Instant from a microsecond count since system boot.
+    pub const fn from_micros(micros: u64) -> Self {
+        Self {
+            ticks: micros * (TICKS_PER_SECOND / GCD_1M) / (1_000_000 / GCD_1M),
+        }
+    }
+
     /// Create an Instant from a millisecond count since system boot.
     pub const fn from_millis(millis: u64) -> Self {
         Self {
-            ticks: millis * TICKS_PER_SECOND / 1000,
+            ticks: millis * (TICKS_PER_SECOND / GCD_1K) / (1000 / GCD_1K),
         }
     }
 
@@ -54,7 +61,12 @@ impl Instant {
 
     /// Milliseconds since system boot.
     pub const fn as_millis(&self) -> u64 {
-        self.ticks * 1000 / TICKS_PER_SECOND
+        self.ticks * (1000 / GCD_1K) / (TICKS_PER_SECOND / GCD_1K)
+    }
+
+    /// Microseconds since system boot.
+    pub const fn as_micros(&self) -> u64 {
+        self.ticks * (1_000_000 / GCD_1M) / (TICKS_PER_SECOND / GCD_1M)
     }
 
     /// Duration between this Instant and another Instant

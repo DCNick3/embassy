@@ -3,35 +3,61 @@ use core::cell::Cell;
 use core::convert::TryInto;
 use core::sync::atomic::{compiler_fence, Ordering};
 use core::{mem, ptr};
+use embassy::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy::blocking_mutex::Mutex;
 use embassy::interrupt::InterruptExt;
 use embassy::time::driver::{AlarmHandle, Driver};
 use embassy::time::TICKS_PER_SECOND;
 use stm32_metapac::timer::regs;
 
 use crate::interrupt;
-use crate::interrupt::{CriticalSection, Interrupt, Mutex};
-use crate::pac::timer::{vals, TimGp16};
+use crate::interrupt::CriticalSection;
+use crate::pac::timer::vals;
 use crate::peripherals;
 use crate::rcc::sealed::RccPeripheral;
-
-use self::sealed::Instance as _;
+use crate::timer::sealed::Basic16bitInstance as BasicInstance;
+use crate::timer::sealed::GeneralPurpose16bitInstance as Instance;
 
 const ALARM_COUNT: usize = 3;
 
-#[cfg(feature = "time-driver-tim2")]
+#[cfg(time_driver_tim2)]
 type T = peripherals::TIM2;
-#[cfg(feature = "time-driver-tim3")]
+#[cfg(time_driver_tim3)]
 type T = peripherals::TIM3;
+#[cfg(time_driver_tim4)]
+type T = peripherals::TIM4;
+#[cfg(time_driver_tim5)]
+type T = peripherals::TIM5;
 
-#[cfg(feature = "time-driver-tim2")]
-#[interrupt]
-fn TIM2() {
-    DRIVER.on_interrupt()
-}
-#[cfg(feature = "time-driver-tim3")]
-#[interrupt]
-fn TIM3() {
-    DRIVER.on_interrupt()
+foreach_interrupt! {
+    (TIM2, timer, $block:ident, UP, $irq:ident) => {
+        #[cfg(time_driver_tim2)]
+        #[interrupt]
+        fn $irq() {
+            DRIVER.on_interrupt()
+        }
+    };
+    (TIM3, timer, $block:ident, UP, $irq:ident) => {
+        #[cfg(time_driver_tim3)]
+        #[interrupt]
+        fn $irq() {
+            DRIVER.on_interrupt()
+        }
+    };
+    (TIM4, timer, $block:ident, UP, $irq:ident) => {
+        #[cfg(time_driver_tim4)]
+        #[interrupt]
+        fn $irq() {
+            DRIVER.on_interrupt()
+        }
+    };
+    (TIM5, timer, $block:ident, UP, $irq:ident) => {
+        #[cfg(time_driver_tim5)]
+        #[interrupt]
+        fn $irq() {
+            DRIVER.on_interrupt()
+        }
+    };
 }
 
 // Clock timekeeping works with something we call "periods", which are time intervals
@@ -77,27 +103,29 @@ impl AlarmState {
 }
 
 struct RtcDriver {
+    timer: T,
     /// Number of 2^15 periods elapsed since boot.
     period: AtomicU32,
     alarm_count: AtomicU8,
     /// Timestamp at which to fire alarm. u64::MAX if no alarm is scheduled.
-    alarms: Mutex<[AlarmState; ALARM_COUNT]>,
+    alarms: Mutex<CriticalSectionRawMutex, [AlarmState; ALARM_COUNT]>,
 }
 
 const ALARM_STATE_NEW: AlarmState = AlarmState::new();
 
 embassy::time_driver_impl!(static DRIVER: RtcDriver = RtcDriver {
+    timer: unsafe { core::mem::transmute(()) }, // steal is not const
     period: AtomicU32::new(0),
     alarm_count: AtomicU8::new(0),
-    alarms: Mutex::new([ALARM_STATE_NEW; ALARM_COUNT]),
+    alarms: Mutex::const_new(CriticalSectionRawMutex::new(), [ALARM_STATE_NEW; ALARM_COUNT]),
 });
 
 impl RtcDriver {
     fn init(&'static self) {
-        let r = T::regs();
+        let r = self.timer.regs_gp16();
 
-        T::enable();
-        T::reset();
+        <T as RccPeripheral>::enable();
+        <T as RccPeripheral>::reset();
 
         let timer_freq = T::frequency();
 
@@ -126,7 +154,7 @@ impl RtcDriver {
             // Enable CC0, disable others
             r.dier().write(|w| w.set_ccie(0, true));
 
-            let irq: <T as sealed::Instance>::Interrupt = core::mem::transmute(());
+            let irq: <T as BasicInstance>::Interrupt = core::mem::transmute(());
             irq.unpend();
             irq.enable();
 
@@ -135,7 +163,7 @@ impl RtcDriver {
     }
 
     fn on_interrupt(&self) {
-        let r = T::regs();
+        let r = self.timer.regs_gp16();
 
         // NOTE(unsafe) Use critical section to access the methods
         // XXX: reduce the size of this critical section ?
@@ -166,7 +194,7 @@ impl RtcDriver {
     }
 
     fn next_period(&self) {
-        let r = T::regs();
+        let r = self.timer.regs_gp16();
 
         let period = self.period.fetch_add(1, Ordering::Relaxed) + 1;
         let t = (period as u64) << 15;
@@ -208,7 +236,7 @@ impl RtcDriver {
 
 impl Driver for RtcDriver {
     fn now(&self) -> u64 {
-        let r = T::regs();
+        let r = self.timer.regs_gp16();
 
         let period = self.period.load(Ordering::Relaxed);
         compiler_fence(Ordering::Acquire);
@@ -245,7 +273,7 @@ impl Driver for RtcDriver {
 
     fn set_alarm(&self, alarm: AlarmHandle, timestamp: u64) {
         critical_section::with(|cs| {
-            let r = T::regs();
+            let r = self.timer.regs_gp16();
 
             let n = alarm.id() as _;
             let alarm = self.get_alarm(cs, alarm);
@@ -275,37 +303,3 @@ impl Driver for RtcDriver {
 pub(crate) fn init() {
     DRIVER.init()
 }
-
-// ------------------------------------------------------
-
-pub(crate) mod sealed {
-    use super::*;
-    pub trait Instance {
-        type Interrupt: Interrupt;
-
-        fn regs() -> TimGp16;
-    }
-}
-
-pub trait Instance: sealed::Instance + Sized + RccPeripheral + 'static {}
-
-macro_rules! impl_timer {
-    ($inst:ident) => {
-        impl sealed::Instance for peripherals::$inst {
-            type Interrupt = crate::interrupt::$inst;
-
-            fn regs() -> TimGp16 {
-                crate::pac::timer::TimGp16(crate::pac::$inst.0)
-            }
-        }
-
-        impl Instance for peripherals::$inst {}
-    };
-}
-
-crate::pac::peripherals!(
-    (timer, TIM2) => { impl_timer!(TIM2); };
-    (timer, TIM3) => { impl_timer!(TIM3); };
-    (timer, TIM4) => { impl_timer!(TIM4); };
-    (timer, TIM5) => { impl_timer!(TIM5); };
-);

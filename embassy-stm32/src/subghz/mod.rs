@@ -82,14 +82,10 @@ use crate::{
     pac,
     peripherals::SUBGHZSPI,
     rcc::sealed::RccPeripheral,
-    spi::{ByteOrder, Config as SpiConfig, MisoPin, MosiPin, SckPin, Spi},
+    spi::{BitOrder, Config as SpiConfig, MisoPin, MosiPin, SckPin, Spi, MODE_0},
     time::Hertz,
 };
 use embassy::util::Unborrow;
-use embedded_hal::{
-    blocking::spi::{Transfer, Write},
-    spi::MODE_0,
-};
 
 /// Passthrough for SPI errors (for now)
 pub type Error = crate::spi::Error;
@@ -219,11 +215,11 @@ impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx> {
     /// clock.
     pub fn new(
         peri: impl Unborrow<Target = SUBGHZSPI> + 'd,
-        sck: impl Unborrow<Target = impl SckPin<SUBGHZSPI>>,
-        mosi: impl Unborrow<Target = impl MosiPin<SUBGHZSPI>>,
-        miso: impl Unborrow<Target = impl MisoPin<SUBGHZSPI>>,
-        txdma: impl Unborrow<Target = Tx>,
-        rxdma: impl Unborrow<Target = Rx>,
+        sck: impl Unborrow<Target = impl SckPin<SUBGHZSPI>> + 'd,
+        mosi: impl Unborrow<Target = impl MosiPin<SUBGHZSPI>> + 'd,
+        miso: impl Unborrow<Target = impl MisoPin<SUBGHZSPI>> + 'd,
+        txdma: impl Unborrow<Target = Tx> + 'd,
+        rxdma: impl Unborrow<Target = Rx> + 'd,
     ) -> Self {
         Self::pulse_radio_reset();
 
@@ -233,7 +229,7 @@ impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx> {
         let clk = Hertz(core::cmp::min(SUBGHZSPI::frequency().0 / 2, 16_000_000));
         let mut config = SpiConfig::default();
         config.mode = MODE_0;
-        config.byte_order = ByteOrder::MsbFirst;
+        config.bit_order = BitOrder::MsbFirst;
         let spi = Spi::new(peri, sck, mosi, miso, txdma, rxdma, clk, config);
 
         unsafe { wakeup() };
@@ -255,8 +251,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
         self.poll_not_busy();
         {
             let _nss: Nss = Nss::new();
-            self.spi.write(&[opcode as u8])?;
-            self.spi.transfer(data)?;
+            self.spi.blocking_write(&[opcode as u8])?;
+            self.spi.blocking_transfer_in_place(data)?;
         }
         self.poll_not_busy();
         Ok(())
@@ -280,7 +276,7 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
         self.poll_not_busy();
         {
             let _nss: Nss = Nss::new();
-            self.spi.write(data)?;
+            self.spi.blocking_write(data)?;
         }
         self.poll_not_busy();
         Ok(())
@@ -290,8 +286,9 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
         self.poll_not_busy();
         {
             let _nss: Nss = Nss::new();
-            self.spi.write(&[OpCode::WriteBuffer as u8, offset])?;
-            self.spi.write(data)?;
+            self.spi
+                .blocking_write(&[OpCode::WriteBuffer as u8, offset])?;
+            self.spi.blocking_write(data)?;
         }
         self.poll_not_busy();
 
@@ -308,9 +305,10 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
         self.poll_not_busy();
         {
             let _nss: Nss = Nss::new();
-            self.spi.write(&[OpCode::ReadBuffer as u8, offset])?;
-            self.spi.transfer(&mut status_buf)?;
-            self.spi.transfer(buf)?;
+            self.spi
+                .blocking_write(&[OpCode::ReadBuffer as u8, offset])?;
+            self.spi.blocking_transfer_in_place(&mut status_buf)?;
+            self.spi.blocking_transfer_in_place(buf)?;
         }
         self.poll_not_busy();
 
@@ -342,8 +340,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
         {
             let _nss: Nss = Nss::new();
             self.spi
-                .write(&[OpCode::WriteRegister as u8, addr[0], addr[1]])?;
-            self.spi.write(data)?;
+                .blocking_write(&[OpCode::WriteRegister as u8, addr[0], addr[1]])?;
+            self.spi.blocking_write(data)?;
         }
         self.poll_not_busy();
 

@@ -28,15 +28,15 @@ pub(crate) mod sealed {
 }
 
 pub struct DMAMUX1;
-#[cfg(rcc_h7)]
+#[cfg(stm32h7)]
 pub struct DMAMUX2;
 
 pub trait MuxChannel: sealed::MuxChannel + super::Channel {
     type Mux;
 }
 
-pac::dma_channels! {
-    ($channel_peri:ident, $dma_peri:ident, $version:ident, $channel_num:expr, {dmamux: $dmamux:ident, dmamux_channel: $dmamux_channel:expr}) => {
+foreach_dma_channel! {
+    ($channel_peri:ident, $dma_peri:ident, $version:ident, $channel_num:expr, $index:expr, {dmamux: $dmamux:ident, dmamux_channel: $dmamux_channel:expr}) => {
         impl sealed::MuxChannel for peripherals::$channel_peri {
             const DMAMUX_CH_NUM: u8 = $dmamux_channel;
             const DMAMUX_REGS: pac::dmamux::Dmamux = pac::$dmamux;
@@ -49,11 +49,5 @@ pac::dma_channels! {
 
 /// safety: must be called only once
 pub(crate) unsafe fn init() {
-    crate::pac::peripheral_rcc! {
-        ($name:ident, dmamux, DMAMUX, $clock:ident, ($reg:ident, $field:ident, $set_field:ident), $rst:tt) => {
-            crate::pac::RCC.$reg().modify(|reg| {
-                reg.$set_field(true);
-            });
-        };
-    }
+    crate::generated::init_dmamux();
 }

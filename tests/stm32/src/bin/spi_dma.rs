@@ -9,13 +9,14 @@ use embassy::executor::Spawner;
 use embassy_stm32::spi::{self, Spi};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::Peripherals;
-use embassy_traits::spi::FullDuplex;
 use example_common::*;
 
 #[embassy::main(config = "config()")]
 async fn main(_spawner: Spawner, p: Peripherals) {
     info!("Hello World!");
 
+    #[cfg(feature = "stm32f103c8")]
+    let (sck, mosi, miso, tx_dma, rx_dma) = (p.PA5, p.PA7, p.PA6, p.DMA1_CH3, p.DMA1_CH2);
     #[cfg(feature = "stm32f429zi")]
     let (sck, mosi, miso, tx_dma, rx_dma) = (p.PA5, p.PA7, p.PA6, p.DMA2_CH3, p.DMA2_CH2);
     #[cfg(feature = "stm32h755zi")]
@@ -43,7 +44,7 @@ async fn main(_spawner: Spawner, p: Peripherals) {
     // Arduino pins D11 and D12 (MOSI-MISO) are connected together with a 1K resistor.
     // so we should get the data we sent back.
     let mut buf = [0; 9];
-    spi.read_write(&mut buf, &data).await.unwrap();
+    spi.transfer(&mut buf, &data).await.unwrap();
     assert_eq!(buf, data);
 
     info!("Test OK");

@@ -6,7 +6,7 @@ use embassy::util::Unborrow;
 use embassy_hal_common::unborrow;
 
 use crate::gpio::sealed::Pin as _;
-use crate::gpio::{AnyPin, OptionalPin as GpioOptionalPin};
+use crate::gpio::{AnyPin, Pin as GpioPin, PselBits};
 use crate::interrupt::Interrupt;
 use crate::pac;
 use crate::ppi::{Event, Task};
@@ -45,55 +45,107 @@ pub enum Error {
     DMABufferNotInDataMemory,
 }
 
+const MAX_SEQUENCE_LEN: usize = 32767;
+
 impl<'d, T: Instance> SequencePwm<'d, T> {
-    /// Creates the interface to a `SequencePwm`.
-    ///
-    /// Must be started by calling `start`
-    ///
-    /// # Safety
-    ///
-    /// The returned API is safe unless you use `mem::forget` (or similar safe
-    /// mechanisms) on stack allocated buffers which which have been passed to
-    /// [`new()`](SequencePwm::new).
+    /// Create a new 1-channel PWM
     #[allow(unused_unsafe)]
-    pub fn new(
-        _pwm: impl Unborrow<Target = T> + 'd,
-        ch0: impl Unborrow<Target = impl GpioOptionalPin> + 'd,
-        ch1: impl Unborrow<Target = impl GpioOptionalPin> + 'd,
-        ch2: impl Unborrow<Target = impl GpioOptionalPin> + 'd,
-        ch3: impl Unborrow<Target = impl GpioOptionalPin> + 'd,
-        config: SequenceConfig,
-        sequence: &'d [u16],
+    pub fn new_1ch(
+        pwm: impl Unborrow<Target = T> + 'd,
+        ch0: impl Unborrow<Target = impl GpioPin> + 'd,
+        config: Config,
     ) -> Result<Self, Error> {
-        slice_in_ram_or(sequence, Error::DMABufferNotInDataMemory)?;
+        unborrow!(ch0);
+        Self::new_inner(pwm, Some(ch0.degrade()), None, None, None, config)
+    }
 
-        if sequence.len() > 32767 {
-            return Err(Error::SequenceTooLong);
-        }
+    /// Create a new 2-channel PWM
+    #[allow(unused_unsafe)]
+    pub fn new_2ch(
+        pwm: impl Unborrow<Target = T> + 'd,
+        ch0: impl Unborrow<Target = impl GpioPin> + 'd,
+        ch1: impl Unborrow<Target = impl GpioPin> + 'd,
+        config: Config,
+    ) -> Result<Self, Error> {
+        unborrow!(ch0, ch1);
+        Self::new_inner(
+            pwm,
+            Some(ch0.degrade()),
+            Some(ch1.degrade()),
+            None,
+            None,
+            config,
+        )
+    }
 
+    /// Create a new 3-channel PWM
+    #[allow(unused_unsafe)]
+    pub fn new_3ch(
+        pwm: impl Unborrow<Target = T> + 'd,
+        ch0: impl Unborrow<Target = impl GpioPin> + 'd,
+        ch1: impl Unborrow<Target = impl GpioPin> + 'd,
+        ch2: impl Unborrow<Target = impl GpioPin> + 'd,
+        config: Config,
+    ) -> Result<Self, Error> {
+        unborrow!(ch0, ch1, ch2);
+        Self::new_inner(
+            pwm,
+            Some(ch0.degrade()),
+            Some(ch1.degrade()),
+            Some(ch2.degrade()),
+            None,
+            config,
+        )
+    }
+
+    /// Create a new 4-channel PWM
+    #[allow(unused_unsafe)]
+    pub fn new_4ch(
+        pwm: impl Unborrow<Target = T> + 'd,
+        ch0: impl Unborrow<Target = impl GpioPin> + 'd,
+        ch1: impl Unborrow<Target = impl GpioPin> + 'd,
+        ch2: impl Unborrow<Target = impl GpioPin> + 'd,
+        ch3: impl Unborrow<Target = impl GpioPin> + 'd,
+        config: Config,
+    ) -> Result<Self, Error> {
         unborrow!(ch0, ch1, ch2, ch3);
+        Self::new_inner(
+            pwm,
+            Some(ch0.degrade()),
+            Some(ch1.degrade()),
+            Some(ch2.degrade()),
+            Some(ch3.degrade()),
+            config,
+        )
+    }
 
+    fn new_inner(
+        _pwm: impl Unborrow<Target = T> + 'd,
+        ch0: Option<AnyPin>,
+        ch1: Option<AnyPin>,
+        ch2: Option<AnyPin>,
+        ch3: Option<AnyPin>,
+        config: Config,
+    ) -> Result<Self, Error> {
         let r = T::regs();
 
-        if let Some(pin) = ch0.pin_mut() {
+        if let Some(pin) = &ch0 {
             pin.set_low();
             pin.conf().write(|w| w.dir().output());
         }
-        if let Some(pin) = ch1.pin_mut() {
+        if let Some(pin) = &ch1 {
             pin.set_low();
             pin.conf().write(|w| w.dir().output());
         }
-        if let Some(pin) = ch2.pin_mut() {
+        if let Some(pin) = &ch2 {
             pin.set_low();
             pin.conf().write(|w| w.dir().output());
         }
-        if let Some(pin) = ch3.pin_mut() {
+        if let Some(pin) = &ch3 {
             pin.set_low();
             pin.conf().write(|w| w.dir().output());
         }
 
-        // if NoPin provided writes disconnected (top bit 1) 0x80000000 else
-        // writes pin number ex 13 (0x0D) which is connected (top bit 0)
         r.psel.out[0].write(|w| unsafe { w.bits(ch0.psel_bits()) });
         r.psel.out[1].write(|w| unsafe { w.bits(ch1.psel_bits()) });
         r.psel.out[2].write(|w| unsafe { w.bits(ch2.psel_bits()) });
@@ -109,28 +161,6 @@ impl<'d, T: Instance> SequencePwm<'d, T> {
         r.events_pwmperiodend.reset();
         r.events_seqstarted[0].reset();
         r.events_seqstarted[1].reset();
-
-        r.seq0
-            .ptr
-            .write(|w| unsafe { w.bits(sequence.as_ptr() as u32) });
-        r.seq0
-            .cnt
-            .write(|w| unsafe { w.bits(sequence.len() as u32) });
-        r.seq0.refresh.write(|w| unsafe { w.bits(config.refresh) });
-        r.seq0
-            .enddelay
-            .write(|w| unsafe { w.bits(config.end_delay) });
-
-        r.seq1
-            .ptr
-            .write(|w| unsafe { w.bits(sequence.as_ptr() as u32) });
-        r.seq1
-            .cnt
-            .write(|w| unsafe { w.bits(sequence.len() as u32) });
-        r.seq1.refresh.write(|w| unsafe { w.bits(config.refresh) });
-        r.seq1
-            .enddelay
-            .write(|w| unsafe { w.bits(config.end_delay) });
 
         r.decoder.write(|w| {
             w.load().bits(config.sequence_load as u8);
@@ -148,64 +178,11 @@ impl<'d, T: Instance> SequencePwm<'d, T> {
 
         Ok(Self {
             phantom: PhantomData,
-            ch0: ch0.degrade_optional(),
-            ch1: ch1.degrade_optional(),
-            ch2: ch2.degrade_optional(),
-            ch3: ch3.degrade_optional(),
+            ch0,
+            ch1,
+            ch2,
+            ch3,
         })
-    }
-
-    /// Start or restart playback
-    #[inline(always)]
-    pub fn start(&self, times: SequenceMode) -> Result<(), Error> {
-        if let SequenceMode::Times(0) = times {
-            return Err(Error::SequenceTimesAtLeastOne);
-        }
-        let r = T::regs();
-
-        self.stop();
-
-        r.enable.write(|w| w.enable().enabled());
-
-        // defensive before seqstart
-        compiler_fence(Ordering::SeqCst);
-
-        match times {
-            // just the one time, no loop count
-            SequenceMode::Times(1) => {
-                r.loop_.write(|w| w.cnt().disabled());
-                // tasks_seqstart() doesn't exist in all svds so write its bit instead
-                r.tasks_seqstart[0].write(|w| unsafe { w.bits(0x01) });
-            }
-            // loop count is how many times to play BOTH sequences
-            // 2 total  (1 x 2)
-            // 3 total, (2 x 2) - 1
-            SequenceMode::Times(n) => {
-                let odd = n & 1 == 1;
-                let times = if odd { (n / 2) + 1 } else { n / 2 };
-
-                r.loop_.write(|w| unsafe { w.cnt().bits(times) });
-
-                // we can subtract 1 by starting at seq1 instead of seq0
-                if odd {
-                    // tasks_seqstart() doesn't exist in all svds so write its bit instead
-                    r.tasks_seqstart[1].write(|w| unsafe { w.bits(0x01) });
-                } else {
-                    // tasks_seqstart() doesn't exist in all svds so write its bit instead
-                    r.tasks_seqstart[0].write(|w| unsafe { w.bits(0x01) });
-                }
-            }
-            // to play infinitely, repeat the sequence one time, then have loops done self trigger seq0 again
-            SequenceMode::Infinite => {
-                r.loop_.write(|w| unsafe { w.cnt().bits(0x1) });
-                r.shorts.write(|w| w.loopsdone_seqstart0().enabled());
-
-                // tasks_seqstart() doesn't exist in all svds so write its bit instead
-                r.tasks_seqstart[0].write(|w| unsafe { w.bits(0x01) });
-            }
-        }
-
-        Ok(())
     }
 
     /// Returns reference to `Stopped` event endpoint for PPI.
@@ -307,29 +284,11 @@ impl<'d, T: Instance> SequencePwm<'d, T> {
 
         Task::from_reg(&r.tasks_stop)
     }
-
-    /// Stop playback. Disables the peripheral. Does NOT clear the last duty
-    /// cycle from the pin.
-    #[inline(always)]
-    pub fn stop(&self) {
-        let r = T::regs();
-
-        r.shorts.reset();
-
-        compiler_fence(Ordering::SeqCst);
-
-        // tasks_stop() doesn't exist in all svds so write its bit instead
-        r.tasks_stop.write(|w| unsafe { w.bits(0x01) });
-
-        r.enable.write(|w| w.enable().disabled());
-    }
 }
 
 impl<'a, T: Instance> Drop for SequencePwm<'a, T> {
     fn drop(&mut self) {
         let r = T::regs();
-
-        self.stop();
 
         if let Some(pin) = &self.ch0 {
             pin.set_low();
@@ -354,9 +313,9 @@ impl<'a, T: Instance> Drop for SequencePwm<'a, T> {
     }
 }
 
-/// Configure an infinite looping sequence for `SequencePwm`
+/// Configuration for the PWM as a whole.
 #[non_exhaustive]
-pub struct SequenceConfig {
+pub struct Config {
     /// Selects up mode or up-and-down mode for the counter
     pub counter_mode: CounterMode,
     /// Top value to be compared against buffer values
@@ -365,6 +324,23 @@ pub struct SequenceConfig {
     pub prescaler: Prescaler,
     /// How a sequence is read from RAM and is spread to the compare register
     pub sequence_load: SequenceLoad,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            counter_mode: CounterMode::Up,
+            max_duty: 1000,
+            prescaler: Prescaler::Div16,
+            sequence_load: SequenceLoad::Common,
+        }
+    }
+}
+
+/// Configuration per sequence
+#[non_exhaustive]
+#[derive(Clone)]
+pub struct SequenceConfig {
     /// Number of PWM periods to delay between each sequence sample
     pub refresh: u32,
     /// Number of PWM periods after the sequence ends before starting the next sequence
@@ -374,21 +350,215 @@ pub struct SequenceConfig {
 impl Default for SequenceConfig {
     fn default() -> SequenceConfig {
         SequenceConfig {
-            counter_mode: CounterMode::Up,
-            max_duty: 1000,
-            prescaler: Prescaler::Div16,
-            sequence_load: SequenceLoad::Common,
             refresh: 0,
             end_delay: 0,
         }
     }
 }
 
-/// How many times to run the sequence
+/// A composition of a sequence buffer and its configuration.
+#[non_exhaustive]
+pub struct Sequence<'s> {
+    /// The words comprising the sequence. Must not exceed 32767 words.
+    pub words: &'s [u16],
+    /// Configuration associated with the sequence.
+    pub config: SequenceConfig,
+}
+
+impl<'s> Sequence<'s> {
+    pub fn new(words: &'s [u16], config: SequenceConfig) -> Self {
+        Self { words, config }
+    }
+}
+
+/// A single sequence that can be started and stopped.
+/// Takes at one sequence along with its configuration.
+#[non_exhaustive]
+pub struct SingleSequencer<'d, 's, T: Instance> {
+    pub sequencer: Sequencer<'d, 's, T>,
+}
+
+impl<'d, 's, T: Instance> SingleSequencer<'d, 's, T> {
+    /// Create a new sequencer
+    pub fn new(pwm: &'s mut SequencePwm<'d, T>, words: &'s [u16], config: SequenceConfig) -> Self {
+        Self {
+            sequencer: Sequencer::new(pwm, Sequence::new(words, config), None),
+        }
+    }
+
+    /// Start or restart playback.
+    #[inline(always)]
+    pub fn start(&self, times: SingleSequenceMode) -> Result<(), Error> {
+        let (start_seq, times) = match times {
+            SingleSequenceMode::Times(n) if n == 1 => (StartSequence::One, SequenceMode::Loop(1)),
+            SingleSequenceMode::Times(n) if n & 1 == 1 => {
+                (StartSequence::One, SequenceMode::Loop((n / 2) + 1))
+            }
+            SingleSequenceMode::Times(n) => (StartSequence::Zero, SequenceMode::Loop(n / 2)),
+            SingleSequenceMode::Infinite => (StartSequence::Zero, SequenceMode::Infinite),
+        };
+        self.sequencer.start(start_seq, times)
+    }
+
+    /// Stop playback. Disables the peripheral. Does NOT clear the last duty
+    /// cycle from the pin. Returns any sequences previously provided to
+    /// `start` so that they may be further mutated.
+    #[inline(always)]
+    pub fn stop(&self) {
+        self.sequencer.stop();
+    }
+}
+
+/// A composition of sequences that can be started and stopped.
+/// Takes at least one sequence along with its configuration.
+/// Optionally takes a second sequence and its configuration.
+/// In the case where no second sequence is provided then the first sequence
+/// is used.
+#[non_exhaustive]
+pub struct Sequencer<'d, 's, T: Instance> {
+    _pwm: &'s mut SequencePwm<'d, T>,
+    sequence0: Sequence<'s>,
+    sequence1: Option<Sequence<'s>>,
+}
+
+impl<'d, 's, T: Instance> Sequencer<'d, 's, T> {
+    /// Create a new double sequence. In the absence of sequence 1, sequence 0
+    /// will be used twice in the one loop.
+    pub fn new(
+        pwm: &'s mut SequencePwm<'d, T>,
+        sequence0: Sequence<'s>,
+        sequence1: Option<Sequence<'s>>,
+    ) -> Self {
+        Sequencer {
+            _pwm: pwm,
+            sequence0,
+            sequence1,
+        }
+    }
+
+    /// Start or restart playback. The sequence mode applies to both sequences combined as one.
+    #[inline(always)]
+    pub fn start(&self, start_seq: StartSequence, times: SequenceMode) -> Result<(), Error> {
+        let sequence0 = &self.sequence0;
+        let alt_sequence = self.sequence1.as_ref().unwrap_or(&self.sequence0);
+
+        slice_in_ram_or(sequence0.words, Error::DMABufferNotInDataMemory)?;
+        slice_in_ram_or(alt_sequence.words, Error::DMABufferNotInDataMemory)?;
+
+        if sequence0.words.len() > MAX_SEQUENCE_LEN || alt_sequence.words.len() > MAX_SEQUENCE_LEN {
+            return Err(Error::SequenceTooLong);
+        }
+
+        if let SequenceMode::Loop(0) = times {
+            return Err(Error::SequenceTimesAtLeastOne);
+        }
+
+        let _ = self.stop();
+
+        let r = T::regs();
+
+        r.seq0
+            .refresh
+            .write(|w| unsafe { w.bits(sequence0.config.refresh) });
+        r.seq0
+            .enddelay
+            .write(|w| unsafe { w.bits(sequence0.config.end_delay) });
+        r.seq0
+            .ptr
+            .write(|w| unsafe { w.bits(sequence0.words.as_ptr() as u32) });
+        r.seq0
+            .cnt
+            .write(|w| unsafe { w.bits(sequence0.words.len() as u32) });
+
+        r.seq1
+            .refresh
+            .write(|w| unsafe { w.bits(alt_sequence.config.refresh) });
+        r.seq1
+            .enddelay
+            .write(|w| unsafe { w.bits(alt_sequence.config.end_delay) });
+        r.seq1
+            .ptr
+            .write(|w| unsafe { w.bits(alt_sequence.words.as_ptr() as u32) });
+        r.seq1
+            .cnt
+            .write(|w| unsafe { w.bits(alt_sequence.words.len() as u32) });
+
+        r.enable.write(|w| w.enable().enabled());
+
+        // defensive before seqstart
+        compiler_fence(Ordering::SeqCst);
+
+        let seqstart_index = if start_seq == StartSequence::One {
+            1
+        } else {
+            0
+        };
+
+        match times {
+            // just the one time, no loop count
+            SequenceMode::Loop(n) => {
+                r.loop_.write(|w| unsafe { w.cnt().bits(n) });
+            }
+            // to play infinitely, repeat the sequence one time, then have loops done self trigger seq0 again
+            SequenceMode::Infinite => {
+                r.loop_.write(|w| unsafe { w.cnt().bits(0x1) });
+                r.shorts.write(|w| w.loopsdone_seqstart0().enabled());
+            }
+        }
+
+        // tasks_seqstart() doesn't exist in all svds so write its bit instead
+        r.tasks_seqstart[seqstart_index].write(|w| unsafe { w.bits(0x01) });
+
+        Ok(())
+    }
+
+    /// Stop playback. Disables the peripheral. Does NOT clear the last duty
+    /// cycle from the pin. Returns any sequences previously provided to
+    /// `start` so that they may be further mutated.
+    #[inline(always)]
+    pub fn stop(&self) {
+        let r = T::regs();
+
+        r.shorts.reset();
+
+        compiler_fence(Ordering::SeqCst);
+
+        // tasks_stop() doesn't exist in all svds so write its bit instead
+        r.tasks_stop.write(|w| unsafe { w.bits(0x01) });
+
+        r.enable.write(|w| w.enable().disabled());
+    }
+}
+
+impl<'d, 's, T: Instance> Drop for Sequencer<'d, 's, T> {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+/// How many times to run a single sequence
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub enum SingleSequenceMode {
+    /// Run a single sequence n Times total.
+    Times(u16),
+    /// Repeat until `stop` is called.
+    Infinite,
+}
+
+/// Which sequence to start a loop with
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub enum StartSequence {
+    /// Start with Sequence 0
+    Zero,
+    /// Start with Sequence 1
+    One,
+}
+
+/// How many loops to run two sequences
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub enum SequenceMode {
-    /// Run sequence n Times total
-    Times(u16),
+    /// Run two sequences n loops i.e. (n * (seq0 + seq1.unwrap_or(seq0)))
+    Loop(u16),
     /// Repeat until `stop` is called.
     Infinite,
 }
@@ -432,41 +602,86 @@ pub enum CounterMode {
 }
 
 impl<'d, T: Instance> SimplePwm<'d, T> {
-    /// Creates the interface to a `SimplePwm`
-    ///
-    /// Enables the peripheral, defaults the freq to 1Mhz, max_duty 1000, duty
-    /// 0, up mode, and pins low. Must be started by calling `set_duty`
-    ///
-    /// # Safety
-    ///
-    /// The returned API is safe unless you use `mem::forget` (or similar safe
-    /// mechanisms) on stack allocated buffers which which have been passed to
-    /// [`new()`](SimplePwm::new).
+    /// Create a new 1-channel PWM
     #[allow(unused_unsafe)]
-    pub fn new(
-        _pwm: impl Unborrow<Target = T> + 'd,
-        ch0: impl Unborrow<Target = impl GpioOptionalPin> + 'd,
-        ch1: impl Unborrow<Target = impl GpioOptionalPin> + 'd,
-        ch2: impl Unborrow<Target = impl GpioOptionalPin> + 'd,
-        ch3: impl Unborrow<Target = impl GpioOptionalPin> + 'd,
+    pub fn new_1ch(
+        pwm: impl Unborrow<Target = T> + 'd,
+        ch0: impl Unborrow<Target = impl GpioPin> + 'd,
+    ) -> Self {
+        unborrow!(ch0);
+        Self::new_inner(pwm, Some(ch0.degrade()), None, None, None)
+    }
+
+    /// Create a new 2-channel PWM
+    #[allow(unused_unsafe)]
+    pub fn new_2ch(
+        pwm: impl Unborrow<Target = T> + 'd,
+        ch0: impl Unborrow<Target = impl GpioPin> + 'd,
+        ch1: impl Unborrow<Target = impl GpioPin> + 'd,
+    ) -> Self {
+        unborrow!(ch0, ch1);
+        Self::new_inner(pwm, Some(ch0.degrade()), Some(ch1.degrade()), None, None)
+    }
+
+    /// Create a new 3-channel PWM
+    #[allow(unused_unsafe)]
+    pub fn new_3ch(
+        pwm: impl Unborrow<Target = T> + 'd,
+        ch0: impl Unborrow<Target = impl GpioPin> + 'd,
+        ch1: impl Unborrow<Target = impl GpioPin> + 'd,
+        ch2: impl Unborrow<Target = impl GpioPin> + 'd,
+    ) -> Self {
+        unborrow!(ch0, ch1, ch2);
+        Self::new_inner(
+            pwm,
+            Some(ch0.degrade()),
+            Some(ch1.degrade()),
+            Some(ch2.degrade()),
+            None,
+        )
+    }
+
+    /// Create a new 4-channel PWM
+    #[allow(unused_unsafe)]
+    pub fn new_4ch(
+        pwm: impl Unborrow<Target = T> + 'd,
+        ch0: impl Unborrow<Target = impl GpioPin> + 'd,
+        ch1: impl Unborrow<Target = impl GpioPin> + 'd,
+        ch2: impl Unborrow<Target = impl GpioPin> + 'd,
+        ch3: impl Unborrow<Target = impl GpioPin> + 'd,
     ) -> Self {
         unborrow!(ch0, ch1, ch2, ch3);
+        Self::new_inner(
+            pwm,
+            Some(ch0.degrade()),
+            Some(ch1.degrade()),
+            Some(ch2.degrade()),
+            Some(ch3.degrade()),
+        )
+    }
 
+    fn new_inner(
+        _pwm: impl Unborrow<Target = T> + 'd,
+        ch0: Option<AnyPin>,
+        ch1: Option<AnyPin>,
+        ch2: Option<AnyPin>,
+        ch3: Option<AnyPin>,
+    ) -> Self {
         let r = T::regs();
 
-        if let Some(pin) = ch0.pin_mut() {
+        if let Some(pin) = &ch0 {
             pin.set_low();
             pin.conf().write(|w| w.dir().output());
         }
-        if let Some(pin) = ch1.pin_mut() {
+        if let Some(pin) = &ch1 {
             pin.set_low();
             pin.conf().write(|w| w.dir().output());
         }
-        if let Some(pin) = ch2.pin_mut() {
+        if let Some(pin) = &ch2 {
             pin.set_low();
             pin.conf().write(|w| w.dir().output());
         }
-        if let Some(pin) = ch3.pin_mut() {
+        if let Some(pin) = &ch3 {
             pin.set_low();
             pin.conf().write(|w| w.dir().output());
         }
@@ -480,10 +695,10 @@ impl<'d, T: Instance> SimplePwm<'d, T> {
 
         let pwm = Self {
             phantom: PhantomData,
-            ch0: ch0.degrade_optional(),
-            ch1: ch1.degrade_optional(),
-            ch2: ch2.degrade_optional(),
-            ch3: ch3.degrade_optional(),
+            ch0,
+            ch1,
+            ch2,
+            ch3,
             duty: [0; 4],
         };
 

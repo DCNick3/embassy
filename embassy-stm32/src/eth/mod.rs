@@ -33,3 +33,28 @@ pub unsafe trait PHY {
     /// Poll link to see if it is up and FD with 100Mbps
     fn poll_link<S: StationManagement>(sm: &mut S) -> bool;
 }
+
+pub(crate) mod sealed {
+    pub trait Instance {
+        fn regs() -> crate::pac::eth::Eth;
+    }
+}
+
+pub trait Instance: sealed::Instance + Send + 'static {}
+
+impl sealed::Instance for crate::peripherals::ETH {
+    fn regs() -> crate::pac::eth::Eth {
+        crate::pac::ETH
+    }
+}
+impl Instance for crate::peripherals::ETH {}
+
+pin_trait!(RefClkPin, Instance);
+pin_trait!(MDIOPin, Instance);
+pin_trait!(MDCPin, Instance);
+pin_trait!(CRSPin, Instance);
+pin_trait!(RXD0Pin, Instance);
+pin_trait!(RXD1Pin, Instance);
+pin_trait!(TXD0Pin, Instance);
+pin_trait!(TXD1Pin, Instance);
+pin_trait!(TXEnPin, Instance);

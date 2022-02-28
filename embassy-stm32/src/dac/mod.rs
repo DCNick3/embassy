@@ -3,28 +3,20 @@
 #[cfg_attr(dac_v1, path = "v1.rs")]
 #[cfg_attr(dac_v2, path = "v2.rs")]
 mod _version;
-use crate::gpio::NoPin;
 use crate::peripherals;
 pub use _version::*;
 
 pub(crate) mod sealed {
-    use crate::gpio::OptionalPin;
-
     pub trait Instance {
         fn regs() -> &'static crate::pac::dac::Dac;
     }
-
-    pub trait DacPin<T: Instance, const C: u8>: OptionalPin {}
 }
 
 pub trait Instance: sealed::Instance + 'static {}
 
-pub trait DacPin<T: Instance, const C: u8>: sealed::DacPin<T, C> + 'static {}
+pub trait DacPin<T: Instance, const C: u8>: crate::gpio::Pin + 'static {}
 
-impl<T: Instance, const C: u8> DacPin<T, C> for NoPin {}
-impl<T: Instance, const C: u8> sealed::DacPin<T, C> for NoPin {}
-
-crate::pac::peripherals!(
+foreach_peripheral!(
     (dac, $inst:ident) => {
         impl crate::dac::sealed::Instance for peripherals::$inst {
             fn regs() -> &'static crate::pac::dac::Dac {
@@ -36,19 +28,8 @@ crate::pac::peripherals!(
     };
 );
 
-crate::pac::peripheral_pins!(
-    ($inst:ident, dac, DAC, $pin:ident, OUT1) => {
-        impl DacPin<peripherals::$inst, 1> for peripherals::$pin {}
-
-        impl sealed::DacPin<peripherals::$inst, 1> for peripherals::$pin {
-        }
-
+macro_rules! impl_dac_pin {
+    ($inst:ident, $pin:ident, $ch:expr) => {
+        impl crate::dac::DacPin<peripherals::$inst, $ch> for crate::peripherals::$pin {}
     };
-
-    ($inst:ident, dac, DAC, $pin:ident, OUT2) => {
-        impl DacPin<peripherals::$inst, 2> for peripherals::$pin {}
-
-        impl sealed::DacPin<peripherals::$inst, 2> for peripherals::$pin {
-        }
-    };
-);
+}
