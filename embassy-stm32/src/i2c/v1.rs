@@ -1,6 +1,9 @@
 use core::marker::PhantomData;
+use cortex_m::peripheral::DWT;
 use embassy::util::Unborrow;
 use embassy_hal_common::unborrow;
+use nb::Error::{Other, WouldBlock};
+use nb::Result as NbResult;
 
 use crate::gpio::sealed::AFType;
 use crate::i2c::{Error, Instance, SclPin, SdaPin};
@@ -17,6 +20,69 @@ impl State {
 
 pub struct I2c<'d, T: Instance> {
     phantom: PhantomData<&'d mut T>,
+}
+
+// based on stm32f1xx-hal implementation
+// https://docs.rs/stm32f1xx-hal/latest/src/stm32f1xx_hal/i2c/blocking.rs.html
+
+macro_rules! wait_for_flag {
+    ($i2c:expr, $flag:ident) => {{
+        let sr1 = $i2c.sr1().read();
+
+        if sr1.berr() {
+            // The errata indicates that BERR may be incorrectly detected. It recommends ignoring and
+            // clearing the BERR bit instead.
+            $i2c.sr1().modify(|w| w.set_berr(false));
+        }
+
+        if sr1.arlo() {
+            $i2c.sr1().modify(|w| w.set_arlo(false));
+            Err(Other(Error::Arbitration))
+        } else if sr1.af() {
+            $i2c.sr1().modify(|w| w.set_af(false));
+            Err(Other(Error::Nack))
+        } else if sr1.ovr() {
+            $i2c.sr1().modify(|w| w.set_ovr(false));
+            Err(Other(Error::Overrun))
+        } else if sr1.$flag() {
+            Ok(())
+        } else {
+            Err(WouldBlock)
+        }
+    }};
+}
+
+macro_rules! busy_wait {
+    ($nb_expr:expr, $exit_cond:expr) => {{
+        loop {
+            let res = $nb_expr;
+            if res != Err(WouldBlock) {
+                break res;
+            }
+            if $exit_cond {
+                break res;
+            }
+        }
+    }};
+}
+
+macro_rules! busy_wait_cycles {
+    ($nb_expr:expr, $cycles:expr) => {{
+        let started = DWT::get_cycle_count();
+        let cycles = $cycles;
+        busy_wait!(
+            $nb_expr,
+            DWT::get_cycle_count().wrapping_sub(started) >= cycles
+        )
+    }};
+}
+
+fn unwrap_wouldblock<T>(res: NbResult<T, Error>) -> Result<T, Error> {
+    match res {
+        Ok(r) => Ok(r),
+        Err(WouldBlock) => return Err(Error::Timeout),
+        Err(Other(e)) => return Err(e),
+    }
 }
 
 impl<'d, T: Instance> I2c<'d, T> {
@@ -72,6 +138,24 @@ impl<'d, T: Instance> I2c<'d, T> {
         }
     }
 
+    /// Check if START condition is generated. If the condition is not generated, this
+    /// method returns `WouldBlock` so the program can act accordingly
+    /// (busy wait, async, ...)
+    unsafe fn wait_after_sent_start(&mut self) -> NbResult<(), Error> {
+        wait_for_flag!(T::regs(), start)
+    }
+
+    /// Check if STOP condition is generated. If the condition is not generated, this
+    /// method returns `WouldBlock` so the program can act accordingly
+    /// (busy wait, async, ...)
+    unsafe fn wait_for_stop(&mut self) -> NbResult<(), Error> {
+        if !T::regs().cr1().read().stop() {
+            Ok(())
+        } else {
+            Err(WouldBlock)
+        }
+    }
+
     unsafe fn check_and_clear_error_flags(&self) -> Result<i2c::regs::Sr1, Error> {
         // Note that flags should only be cleared once they have been registered. If flags are
         // cleared otherwise, there may be an inherent race condition and flags may be missed.
@@ -119,9 +203,11 @@ impl<'d, T: Instance> I2c<'d, T> {
         });
 
         // Wait until START condition was generated
-        while !self.check_and_clear_error_flags()?.start() {}
+        // TODO: timeout should be configured. Currently is computed as 72 MHz * 1000 us = 72000 cycles
+        unwrap_wouldblock(busy_wait_cycles!(self.wait_after_sent_start(), 72000))?;
 
         // Also wait until signalled we're master and everything is waiting for us
+        // TODO: this should have timeout too
         while {
             self.check_and_clear_error_flags()?;
 
@@ -135,7 +221,8 @@ impl<'d, T: Instance> I2c<'d, T> {
         // Wait until address was sent
         // Wait for the address to be acknowledged
         // Check for any I2C errors. If a NACK occurs, the ADDR bit will never be set.
-        while !self.check_and_clear_error_flags()?.addr() {}
+        unwrap_wouldblock(busy_wait_cycles!(wait_for_flag!(T::regs(), addr), 72000))?;
+        // while !self.check_and_clear_error_flags()?.addr() {}
 
         // Clear condition by reading SR2
         let _ = T::regs().sr2().read();
@@ -151,30 +238,27 @@ impl<'d, T: Instance> I2c<'d, T> {
 
     unsafe fn send_byte(&self, byte: u8) -> Result<(), Error> {
         // Wait until we're ready for sending
-        while {
-            // Check for any I2C errors. If a NACK occurs, the ADDR bit will never be set.
-            !self.check_and_clear_error_flags()?.txe()
-        } {}
+        // while {
+        unwrap_wouldblock(busy_wait_cycles!(wait_for_flag!(T::regs(), txe), 72000))?;
+        // Check for any I2C errors. If a NACK occurs, the ADDR bit will never be set.
+        // !self.check_and_clear_error_flags()?.txe()
+        // } {}
 
         // Push out a byte of data
         T::regs().dr().write(|reg| reg.set_dr(byte));
 
         // Wait until byte is transferred
-        while {
-            // Check for any potential error conditions.
-            !self.check_and_clear_error_flags()?.btf()
-        } {}
+        unwrap_wouldblock(busy_wait_cycles!(wait_for_flag!(T::regs(), btf), 72000))?;
+        // while {
+        //     Check for any potential error conditions.
+        // !self.check_and_clear_error_flags()?.btf()
+        // } {}
 
         Ok(())
     }
 
     unsafe fn recv_byte(&self) -> Result<u8, Error> {
-        while {
-            // Check for any potential error conditions.
-            self.check_and_clear_error_flags()?;
-
-            !T::regs().sr1().read().rxne()
-        } {}
+        unwrap_wouldblock(busy_wait_cycles!(wait_for_flag!(T::regs(), rxne), 72000))?;
 
         let value = T::regs().dr().read().dr();
         Ok(value)
@@ -191,9 +275,12 @@ impl<'d, T: Instance> I2c<'d, T> {
             }
 
             // Wait until START condition was generated
-            while unsafe { !T::regs().sr1().read().start() } {}
+            unsafe {
+                unwrap_wouldblock(busy_wait_cycles!(self.wait_after_sent_start(), 72000))?;
+            }
 
             // Also wait until signalled we're master and everything is waiting for us
+            // TODO: needs timeout too
             while {
                 let sr2 = unsafe { T::regs().sr2().read() };
                 !sr2.msl() && !sr2.busy()
@@ -204,7 +291,9 @@ impl<'d, T: Instance> I2c<'d, T> {
 
             // Wait until address was sent
             // Wait for the address to be acknowledged
-            while unsafe { !self.check_and_clear_error_flags()?.addr() } {}
+            unsafe {
+                unwrap_wouldblock(busy_wait_cycles!(wait_for_flag!(T::regs(), addr), 72000))?;
+            }
 
             // Clear condition by reading SR2
             let _ = unsafe { T::regs().sr2().read() };
@@ -226,7 +315,9 @@ impl<'d, T: Instance> I2c<'d, T> {
             *last = unsafe { self.recv_byte()? };
 
             // Wait for the STOP to be sent.
-            while unsafe { T::regs().cr1().read().stop() } {}
+            unsafe {
+                unwrap_wouldblock(busy_wait_cycles!(self.wait_for_stop(), 72000))?;
+            }
 
             // Fallthrough is success
             Ok(())
@@ -241,7 +332,7 @@ impl<'d, T: Instance> I2c<'d, T> {
             // Send a STOP condition
             T::regs().cr1().modify(|reg| reg.set_stop(true));
             // Wait for STOP condition to transmit.
-            while T::regs().cr1().read().stop() {}
+            unwrap_wouldblock(busy_wait_cycles!(self.wait_for_stop(), 72000))?;
         };
 
         // Fallthrough is success
