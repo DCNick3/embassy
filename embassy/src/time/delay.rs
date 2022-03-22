@@ -12,6 +12,7 @@ pub fn block_for(duration: Duration) {
 /// the amount provided, but accuracy can be affected by many factors, including interrupt usage.
 /// Make sure to use a suitable tick rate for your use case. The tick rate is defined by the currently
 /// active driver.
+#[derive(Clone, Copy)]
 pub struct Delay;
 
 #[cfg(feature = "unstable-traits")]

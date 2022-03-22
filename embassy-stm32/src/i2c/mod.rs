@@ -20,6 +20,15 @@ pub enum Error {
     ZeroLengthTransfer,
 }
 
+#[cfg(all(feature = "unstable-traits", feature = "nightly"))]
+mod eh1a {
+    impl embedded_hal_async::i2c::Error for super::Error {
+        fn kind(&self) -> embedded_hal_1::i2c::ErrorKind {
+            todo!()
+        }
+    }
+}
+
 pub(crate) mod sealed {
     use super::*;
     pub trait Instance: crate::rcc::RccPeripheral {
