@@ -58,6 +58,19 @@ fn main() {
         out_dir.display(),
         chip_core_name
     );
+    println!(
+        "cargo:rustc-env=STM32_METAPAC_COMMON_PATH={}/src/common.rs",
+        out_dir.display(),
+    );
 
     println!("cargo:rerun-if-changed=build.rs");
+
+    // When the stm32-data chip's JSON changes, we must rebuild
+    println!(
+        "cargo:rerun-if-changed={}/chips/{}.json",
+        data_dir.display(),
+        chip_name
+    );
+
+    println!("cargo:rerun-if-changed={}/registers", data_dir.display());
 }

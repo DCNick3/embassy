@@ -4,25 +4,19 @@ use core::marker::PhantomData;
 use core::ptr;
 use embassy::util::Unborrow;
 use embassy_hal_common::unborrow;
+use futures::future::join;
 
 use self::sealed::WordSize;
-use crate::dma::NoDma;
+use crate::dma::{slice_ptr_parts, NoDma, Transfer};
 use crate::gpio::sealed::{AFType, Pin as _};
 use crate::gpio::AnyPin;
+use crate::pac::spi::Spi as Regs;
 use crate::pac::spi::{regs, vals};
 use crate::peripherals;
 use crate::rcc::RccPeripheral;
 use crate::time::Hertz;
 
 pub use embedded_hal_02::spi::{Mode, Phase, Polarity, MODE_0, MODE_1, MODE_2, MODE_3};
-
-#[cfg_attr(spi_v1, path = "v1.rs")]
-#[cfg_attr(spi_f1, path = "v1.rs")]
-#[cfg_attr(spi_v2, path = "v2.rs")]
-#[cfg_attr(spi_v3, path = "v3.rs")]
-mod _version;
-
-type Regs = &'static crate::pac::spi::Spi;
 
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -224,10 +218,10 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
 
         #[cfg(any(spi_v1, spi_f1))]
         unsafe {
-            T::regs().cr2().modify(|w| {
+            T::REGS.cr2().modify(|w| {
                 w.set_ssoe(false);
             });
-            T::regs().cr1().modify(|w| {
+            T::REGS.cr1().modify(|w| {
                 w.set_cpha(cpha);
                 w.set_cpol(cpol);
 
@@ -247,12 +241,12 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         }
         #[cfg(spi_v2)]
         unsafe {
-            T::regs().cr2().modify(|w| {
+            T::REGS.cr2().modify(|w| {
                 w.set_frxth(WordSize::EightBit.frxth());
                 w.set_ds(WordSize::EightBit.ds());
                 w.set_ssoe(false);
             });
-            T::regs().cr1().modify(|w| {
+            T::REGS.cr1().modify(|w| {
                 w.set_cpha(cpha);
                 w.set_cpol(cpol);
 
@@ -268,8 +262,8 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         }
         #[cfg(spi_v3)]
         unsafe {
-            T::regs().ifcr().write(|w| w.0 = 0xffff_ffff);
-            T::regs().cfg2().modify(|w| {
+            T::REGS.ifcr().write(|w| w.0 = 0xffff_ffff);
+            T::REGS.cfg2().modify(|w| {
                 //w.set_ssoe(true);
                 w.set_ssoe(false);
                 w.set_cpha(cpha);
@@ -284,16 +278,16 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
                 w.set_afcntr(vals::Afcntr::CONTROLLED);
                 w.set_ssiop(vals::Ssiop::ACTIVEHIGH);
             });
-            T::regs().cfg1().modify(|w| {
+            T::REGS.cfg1().modify(|w| {
                 w.set_crcen(false);
                 w.set_mbr(br);
                 w.set_dsize(WordSize::EightBit.dsize());
             });
-            T::regs().cr2().modify(|w| {
+            T::REGS.cr2().modify(|w| {
                 w.set_tsize(0);
                 w.set_tser(0);
             });
-            T::regs().cr1().modify(|w| {
+            T::REGS.cr1().modify(|w| {
                 w.set_ssi(false);
                 w.set_spe(true);
             });
@@ -319,7 +313,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
 
         #[cfg(any(spi_v1, spi_f1, spi_v2))]
         unsafe {
-            T::regs().cr1().modify(|w| {
+            T::REGS.cr1().modify(|w| {
                 w.set_cpha(cpha);
                 w.set_cpol(cpol);
                 w.set_lsbfirst(lsbfirst);
@@ -328,7 +322,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
 
         #[cfg(spi_v3)]
         unsafe {
-            T::regs().cfg2().modify(|w| {
+            T::REGS.cfg2().modify(|w| {
                 w.set_cpha(cpha);
                 w.set_cpol(cpol);
                 w.set_lsbfirst(lsbfirst);
@@ -338,9 +332,9 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
 
     pub fn get_current_config(&self) -> Config {
         #[cfg(any(spi_v1, spi_f1, spi_v2))]
-        let cfg = unsafe { T::regs().cr1().read() };
+        let cfg = unsafe { T::REGS.cr1().read() };
         #[cfg(spi_v3)]
-        let cfg = unsafe { T::regs().cfg2().read() };
+        let cfg = unsafe { T::REGS.cfg2().read() };
         let polarity = if cfg.cpol() == vals::Cpol::IDLELOW {
             Polarity::IdleLow
         } else {
@@ -371,40 +365,40 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
 
         #[cfg(any(spi_v1, spi_f1))]
         unsafe {
-            T::regs().cr1().modify(|reg| {
+            T::REGS.cr1().modify(|reg| {
                 reg.set_spe(false);
                 reg.set_dff(word_size.dff())
             });
-            T::regs().cr1().modify(|reg| {
+            T::REGS.cr1().modify(|reg| {
                 reg.set_spe(true);
             });
         }
         #[cfg(spi_v2)]
         unsafe {
-            T::regs().cr1().modify(|w| {
+            T::REGS.cr1().modify(|w| {
                 w.set_spe(false);
             });
-            T::regs().cr2().modify(|w| {
+            T::REGS.cr2().modify(|w| {
                 w.set_frxth(word_size.frxth());
                 w.set_ds(word_size.ds());
             });
-            T::regs().cr1().modify(|w| {
+            T::REGS.cr1().modify(|w| {
                 w.set_spe(true);
             });
         }
         #[cfg(spi_v3)]
         unsafe {
-            T::regs().cr1().modify(|w| {
+            T::REGS.cr1().modify(|w| {
                 w.set_csusp(true);
             });
-            while T::regs().sr().read().eot() {}
-            T::regs().cr1().modify(|w| {
+            while T::REGS.sr().read().eot() {}
+            T::REGS.cr1().modify(|w| {
                 w.set_spe(false);
             });
-            T::regs().cfg1().modify(|w| {
+            T::REGS.cfg1().modify(|w| {
                 w.set_dsize(word_size.dsize());
             });
-            T::regs().cr1().modify(|w| {
+            T::REGS.cr1().modify(|w| {
                 w.set_csusp(false);
                 w.set_spe(true);
             });
@@ -413,43 +407,226 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         self.current_word_size = word_size;
     }
 
-    pub async fn write(&mut self, data: &[u8]) -> Result<(), Error>
+    pub async fn write<W: Word>(&mut self, data: &[W]) -> Result<(), Error>
     where
         Tx: TxDma<T>,
     {
-        self.write_dma_u8(data).await
+        if data.len() == 0 {
+            return Ok(());
+        }
+
+        self.set_word_size(W::WORDSIZE);
+        unsafe {
+            T::REGS.cr1().modify(|w| {
+                w.set_spe(false);
+            });
+        }
+
+        let tx_request = self.txdma.request();
+        let tx_dst = T::REGS.tx_ptr();
+        unsafe {
+            self.txdma
+                .start_write(tx_request, data, tx_dst, Default::default())
+        }
+        let tx_f = Transfer::new(&mut self.txdma);
+
+        unsafe {
+            set_txdmaen(T::REGS, true);
+            T::REGS.cr1().modify(|w| {
+                w.set_spe(true);
+            });
+            #[cfg(spi_v3)]
+            T::REGS.cr1().modify(|w| {
+                w.set_cstart(true);
+            });
+        }
+
+        tx_f.await;
+
+        finish_dma(T::REGS);
+
+        Ok(())
     }
 
-    pub async fn read(&mut self, data: &mut [u8]) -> Result<(), Error>
+    pub async fn read<W: Word>(&mut self, data: &mut [W]) -> Result<(), Error>
     where
         Tx: TxDma<T>,
         Rx: RxDma<T>,
     {
-        self.read_dma_u8(data).await
+        if data.len() == 0 {
+            return Ok(());
+        }
+
+        self.set_word_size(W::WORDSIZE);
+        unsafe {
+            T::REGS.cr1().modify(|w| {
+                w.set_spe(false);
+            });
+            set_rxdmaen(T::REGS, true);
+        }
+
+        // SPIv3 clears rxfifo on SPE=0
+        #[cfg(not(spi_v3))]
+        flush_rx_fifo(T::REGS);
+
+        let clock_byte_count = data.len();
+
+        let rx_request = self.rxdma.request();
+        let rx_src = T::REGS.rx_ptr();
+        unsafe {
+            self.rxdma
+                .start_read(rx_request, rx_src, data, Default::default())
+        };
+        let rx_f = Transfer::new(&mut self.rxdma);
+
+        let tx_request = self.txdma.request();
+        let tx_dst = T::REGS.tx_ptr();
+        let clock_byte = 0x00u8;
+        let tx_f = crate::dma::write_repeated(
+            &mut self.txdma,
+            tx_request,
+            clock_byte,
+            clock_byte_count,
+            tx_dst,
+        );
+
+        unsafe {
+            set_txdmaen(T::REGS, true);
+            T::REGS.cr1().modify(|w| {
+                w.set_spe(true);
+            });
+            #[cfg(spi_v3)]
+            T::REGS.cr1().modify(|w| {
+                w.set_cstart(true);
+            });
+        }
+
+        join(tx_f, rx_f).await;
+
+        finish_dma(T::REGS);
+
+        Ok(())
     }
 
-    pub async fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Error>
+    async fn transfer_inner<W: Word>(
+        &mut self,
+        read: *mut [W],
+        write: *const [W],
+    ) -> Result<(), Error>
     where
         Tx: TxDma<T>,
         Rx: RxDma<T>,
     {
-        self.transfer_dma_u8(read, write).await
+        let (_, rx_len) = slice_ptr_parts(read);
+        let (_, tx_len) = slice_ptr_parts(write);
+        assert_eq!(rx_len, tx_len);
+        if rx_len == 0 {
+            return Ok(());
+        }
+
+        self.set_word_size(W::WORDSIZE);
+        unsafe {
+            T::REGS.cr1().modify(|w| {
+                w.set_spe(false);
+            });
+            set_rxdmaen(T::REGS, true);
+        }
+
+        // SPIv3 clears rxfifo on SPE=0
+        #[cfg(not(spi_v3))]
+        flush_rx_fifo(T::REGS);
+
+        let rx_request = self.rxdma.request();
+        let rx_src = T::REGS.rx_ptr();
+        unsafe {
+            self.rxdma
+                .start_read(rx_request, rx_src, read, Default::default())
+        };
+        let rx_f = Transfer::new(&mut self.rxdma);
+
+        let tx_request = self.txdma.request();
+        let tx_dst = T::REGS.tx_ptr();
+        unsafe {
+            self.txdma
+                .start_write(tx_request, write, tx_dst, Default::default())
+        }
+        let tx_f = Transfer::new(&mut self.txdma);
+
+        unsafe {
+            set_txdmaen(T::REGS, true);
+            T::REGS.cr1().modify(|w| {
+                w.set_spe(true);
+            });
+            #[cfg(spi_v3)]
+            T::REGS.cr1().modify(|w| {
+                w.set_cstart(true);
+            });
+        }
+
+        join(tx_f, rx_f).await;
+
+        finish_dma(T::REGS);
+
+        Ok(())
+    }
+
+    pub async fn transfer<W: Word>(&mut self, read: &mut [W], write: &[W]) -> Result<(), Error>
+    where
+        Tx: TxDma<T>,
+        Rx: RxDma<T>,
+    {
+        self.transfer_inner(read, write).await
+    }
+
+    pub async fn transfer_in_place<W: Word>(&mut self, data: &mut [W]) -> Result<(), Error>
+    where
+        Tx: TxDma<T>,
+        Rx: RxDma<T>,
+    {
+        self.transfer_inner(data, data).await
     }
 
     pub fn blocking_write<W: Word>(&mut self, words: &[W]) -> Result<(), Error> {
+        unsafe { T::REGS.cr1().modify(|w| w.set_spe(true)) }
+        flush_rx_fifo(T::REGS);
         self.set_word_size(W::WORDSIZE);
-        let regs = T::regs();
         for word in words.iter() {
-            let _ = transfer_word(regs, *word)?;
+            let _ = transfer_word(T::REGS, *word)?;
+        }
+        Ok(())
+    }
+
+    pub fn blocking_read<W: Word>(&mut self, words: &mut [W]) -> Result<(), Error> {
+        unsafe { T::REGS.cr1().modify(|w| w.set_spe(true)) }
+        flush_rx_fifo(T::REGS);
+        self.set_word_size(W::WORDSIZE);
+        for word in words.iter_mut() {
+            *word = transfer_word(T::REGS, W::default())?;
         }
         Ok(())
     }
 
     pub fn blocking_transfer_in_place<W: Word>(&mut self, words: &mut [W]) -> Result<(), Error> {
+        unsafe { T::REGS.cr1().modify(|w| w.set_spe(true)) }
+        flush_rx_fifo(T::REGS);
         self.set_word_size(W::WORDSIZE);
-        let regs = T::regs();
         for word in words.iter_mut() {
-            *word = transfer_word(regs, *word)?;
+            *word = transfer_word(T::REGS, *word)?;
+        }
+        Ok(())
+    }
+
+    pub fn blocking_transfer<W: Word>(&mut self, read: &mut [W], write: &[W]) -> Result<(), Error> {
+        unsafe { T::REGS.cr1().modify(|w| w.set_spe(true)) }
+        flush_rx_fifo(T::REGS);
+        self.set_word_size(W::WORDSIZE);
+        let len = read.len().max(write.len());
+        for i in 0..len {
+            let wb = write.get(i).copied().unwrap_or_default();
+            let rb = transfer_word(T::REGS, wb)?;
+            if let Some(r) = read.get_mut(i) {
+                *r = rb;
+            }
         }
         Ok(())
     }
@@ -491,7 +668,7 @@ trait RegsExt {
     fn rx_ptr<W>(&self) -> *mut W;
 }
 
-impl RegsExt for crate::pac::spi::Spi {
+impl RegsExt for Regs {
     fn tx_ptr<W>(&self) -> *mut W {
         #[cfg(not(spi_v3))]
         let dr = self.dr();
@@ -570,30 +747,55 @@ fn spin_until_rx_ready(regs: Regs) -> Result<(), Error> {
     }
 }
 
-fn spin_until_idle(regs: Regs) {
-    #[cfg(any(spi_v1, spi_f1))]
+fn flush_rx_fifo(regs: Regs) {
     unsafe {
-        while regs.sr().read().bsy() {}
+        #[cfg(not(spi_v3))]
+        while regs.sr().read().rxne() {
+            let _ = regs.dr().read();
+        }
+        #[cfg(spi_v3)]
+        while regs.sr().read().rxp() {
+            let _ = regs.rxdr().read();
+        }
     }
+}
 
-    #[cfg(spi_v2)]
+fn set_txdmaen(regs: Regs, val: bool) {
     unsafe {
-        while regs.sr().read().ftlvl() > 0 {}
-        while regs.sr().read().frlvl() > 0 {}
-        while regs.sr().read().bsy() {}
+        #[cfg(not(spi_v3))]
+        regs.cr2().modify(|reg| {
+            reg.set_txdmaen(val);
+        });
+        #[cfg(spi_v3)]
+        regs.cfg1().modify(|reg| {
+            reg.set_txdmaen(val);
+        });
     }
+}
 
-    #[cfg(spi_v3)]
+fn set_rxdmaen(regs: Regs, val: bool) {
     unsafe {
-        while !regs.sr().read().txc() {}
-        while regs.sr().read().rxplvl().0 > 0 {}
+        #[cfg(not(spi_v3))]
+        regs.cr2().modify(|reg| {
+            reg.set_rxdmaen(val);
+        });
+        #[cfg(spi_v3)]
+        regs.cfg1().modify(|reg| {
+            reg.set_rxdmaen(val);
+        });
     }
 }
 
 fn finish_dma(regs: Regs) {
-    spin_until_idle(regs);
-
     unsafe {
+        #[cfg(spi_v2)]
+        while regs.sr().read().ftlvl() > 0 {}
+
+        #[cfg(spi_v3)]
+        while !regs.sr().read().txc() {}
+        #[cfg(not(spi_v3))]
+        while regs.sr().read().bsy() {}
+
         regs.cr1().modify(|w| {
             w.set_spe(false);
         });
@@ -669,6 +871,40 @@ mod eh1 {
         type Error = Error;
     }
 
+    impl<'d, T: Instance, Tx, Rx> embedded_hal_1::spi::blocking::SpiBusFlush for Spi<'d, T, Tx, Rx> {
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl<'d, T: Instance, W: Word> embedded_hal_1::spi::blocking::SpiBusRead<W>
+        for Spi<'d, T, NoDma, NoDma>
+    {
+        fn read(&mut self, words: &mut [W]) -> Result<(), Self::Error> {
+            self.blocking_read(words)
+        }
+    }
+
+    impl<'d, T: Instance, W: Word> embedded_hal_1::spi::blocking::SpiBusWrite<W>
+        for Spi<'d, T, NoDma, NoDma>
+    {
+        fn write(&mut self, words: &[W]) -> Result<(), Self::Error> {
+            self.blocking_write(words)
+        }
+    }
+
+    impl<'d, T: Instance, W: Word> embedded_hal_1::spi::blocking::SpiBus<W>
+        for Spi<'d, T, NoDma, NoDma>
+    {
+        fn transfer(&mut self, read: &mut [W], write: &[W]) -> Result<(), Self::Error> {
+            self.blocking_transfer(read, write)
+        }
+
+        fn transfer_in_place(&mut self, words: &mut [W]) -> Result<(), Self::Error> {
+            self.blocking_transfer_in_place(words)
+        }
+    }
+
     impl embedded_hal_1::spi::Error for Error {
         fn kind(&self) -> embedded_hal_1::spi::ErrorKind {
             match *self {
@@ -681,115 +917,53 @@ mod eh1 {
     }
 }
 
-#[cfg(all(feature = "unstable-traits", feature = "nightly"))]
-mod eh1a {
-    use super::*;
-    use core::future::Future;
+cfg_if::cfg_if! {
+    if #[cfg(all(feature = "unstable-traits", feature = "nightly"))] {
+        use core::future::Future;
+        impl<'d, T: Instance, Tx, Rx> embedded_hal_async::spi::SpiBusFlush for Spi<'d, T, Tx, Rx> {
+            type FlushFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
 
-    impl<'d, T: Instance, Tx: TxDma<T>, Rx> embedded_hal_async::spi::Write<u8> for Spi<'d, T, Tx, Rx> {
-        type WriteFuture<'a>
-        where
-            Self: 'a,
-        = impl Future<Output = Result<(), Self::Error>> + 'a;
-
-        fn write<'a>(&'a mut self, data: &'a [u8]) -> Self::WriteFuture<'a> {
-            self.write(data)
-        }
-
-        type WriteTransactionFuture<'a>
-        where
-            Self: 'a,
-        = impl Future<Output = Result<(), Self::Error>> + 'a;
-
-        fn write_transaction<'a>(
-            &'a mut self,
-            words: &'a [&'a [u8]],
-        ) -> Self::WriteTransactionFuture<'a> {
-            async move {
-                for buf in words {
-                    self.write(buf).await?
-                }
-                Ok(())
+            fn flush<'a>(&'a mut self) -> Self::FlushFuture<'a> {
+                async { Ok(()) }
             }
         }
-    }
 
-    impl<'d, T: Instance, Tx: TxDma<T>, Rx: RxDma<T>> embedded_hal_async::spi::Read<u8>
-        for Spi<'d, T, Tx, Rx>
-    {
-        type ReadFuture<'a>
-        where
-            Self: 'a,
-        = impl Future<Output = Result<(), Self::Error>> + 'a;
+        impl<'d, T: Instance, Tx: TxDma<T>, Rx, W: Word> embedded_hal_async::spi::SpiBusWrite<W>
+            for Spi<'d, T, Tx, Rx>
+        {
+            type WriteFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
 
-        fn read<'a>(&'a mut self, data: &'a mut [u8]) -> Self::ReadFuture<'a> {
-            self.read(data)
-        }
-
-        type ReadTransactionFuture<'a>
-        where
-            Self: 'a,
-        = impl Future<Output = Result<(), Self::Error>> + 'a;
-
-        fn read_transaction<'a>(
-            &'a mut self,
-            words: &'a mut [&'a mut [u8]],
-        ) -> Self::ReadTransactionFuture<'a> {
-            async move {
-                for buf in words {
-                    self.read(buf).await?
-                }
-                Ok(())
+            fn write<'a>(&'a mut self, data: &'a [W]) -> Self::WriteFuture<'a> {
+                self.write(data)
             }
         }
-    }
 
-    impl<'d, T: Instance, Tx: TxDma<T>, Rx: RxDma<T>> embedded_hal_async::spi::ReadWrite<u8>
-        for Spi<'d, T, Tx, Rx>
-    {
-        type TransferFuture<'a>
-        where
-            Self: 'a,
-        = impl Future<Output = Result<(), Self::Error>> + 'a;
+        impl<'d, T: Instance, Tx: TxDma<T>, Rx: RxDma<T>, W: Word> embedded_hal_async::spi::SpiBusRead<W>
+            for Spi<'d, T, Tx, Rx>
+        {
+            type ReadFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
 
-        fn transfer<'a>(&'a mut self, rx: &'a mut [u8], tx: &'a [u8]) -> Self::TransferFuture<'a> {
-            self.transfer(rx, tx)
+            fn read<'a>(&'a mut self, data: &'a mut [W]) -> Self::ReadFuture<'a> {
+                self.read(data)
+            }
         }
 
-        type TransferInPlaceFuture<'a>
-        where
-            Self: 'a,
-        = impl Future<Output = Result<(), Self::Error>> + 'a;
+        impl<'d, T: Instance, Tx: TxDma<T>, Rx: RxDma<T>, W: Word> embedded_hal_async::spi::SpiBus<W>
+            for Spi<'d, T, Tx, Rx>
+        {
+            type TransferFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
 
-        fn transfer_in_place<'a>(
-            &'a mut self,
-            words: &'a mut [u8],
-        ) -> Self::TransferInPlaceFuture<'a> {
-            // TODO: Implement async version
-            let result = self.blocking_transfer_in_place(words);
-            async move { result }
-        }
+            fn transfer<'a>(&'a mut self, rx: &'a mut [W], tx: &'a [W]) -> Self::TransferFuture<'a> {
+                self.transfer(rx, tx)
+            }
 
-        type TransactionFuture<'a>
-        where
-            Self: 'a,
-        = impl Future<Output = Result<(), Self::Error>> + 'a;
+            type TransferInPlaceFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
 
-        fn transaction<'a>(
-            &'a mut self,
-            operations: &'a mut [embedded_hal_async::spi::Operation<'a, u8>],
-        ) -> Self::TransactionFuture<'a> {
-            use embedded_hal_1::spi::blocking::Operation;
-            async move {
-                for o in operations {
-                    match o {
-                        Operation::Read(b) => self.read(b).await?,
-                        Operation::Write(b) => self.write(b).await?,
-                        Operation::Transfer(r, w) => self.transfer(r, w).await?,
-                        Operation::TransferInPlace(b) => self.transfer_in_place(b).await?,
-                    }
-                }
-                Ok(())
+            fn transfer_in_place<'a>(
+                &'a mut self,
+                words: &'a mut [W],
+            ) -> Self::TransferInPlaceFuture<'a> {
+                self.transfer_in_place(words)
             }
         }
     }
@@ -799,7 +973,7 @@ pub(crate) mod sealed {
     use super::*;
 
     pub trait Instance {
-        fn regs() -> &'static crate::pac::spi::Spi;
+        const REGS: Regs;
     }
 
     pub trait Word: Copy + 'static {
@@ -862,7 +1036,7 @@ pub(crate) mod sealed {
     }
 }
 
-pub trait Word: Copy + 'static + sealed::Word {}
+pub trait Word: Copy + 'static + sealed::Word + Default + crate::dma::Word {}
 
 impl Word for u8 {}
 impl Word for u16 {}
@@ -877,9 +1051,7 @@ dma_trait!(TxDma, Instance);
 foreach_peripheral!(
     (spi, $inst:ident) => {
         impl sealed::Instance for peripherals::$inst {
-            fn regs() -> &'static crate::pac::spi::Spi {
-                &crate::pac::$inst
-            }
+            const REGS: Regs = crate::pac::$inst;
         }
 
         impl Instance for peripherals::$inst {}

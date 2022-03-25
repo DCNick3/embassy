@@ -5,6 +5,20 @@ authors = ["Dario Nieuwenhuis <dirbaio@dirbaio.net>"]
 edition = "2018"
 resolver = "2"
 
+[package.metadata.embassy_docs]
+features = ["nightly", "defmt", "unstable-traits", "time", "time-tick-1mhz"]
+flavors = [
+    { name = "std",                       target = "x86_64-unknown-linux-gnu",   features = ["std"] },
+    { name = "wasm",                      target = "wasm32-unknown-unknown",     features = ["wasm"] },
+    { name = "thumbv6m-none-eabi",        target = "thumbv6m-none-eabi",         features = [] },
+    { name = "thumbv7m-none-eabi",        target = "thumbv7m-none-eabi",         features = [] },
+    { name = "thumbv7em-none-eabi",       target = "thumbv7em-none-eabi",        features = [] },
+    { name = "thumbv7em-none-eabihf",     target = "thumbv7em-none-eabihf",      features = [] },
+    { name = "thumbv8m.base-none-eabi",   target = "thumbv8m.base-none-eabi",    features = [] },
+    { name = "thumbv8m.main-none-eabi",   target = "thumbv8m.main-none-eabi",    features = [] },
+    { name = "thumbv8m.main-none-eabihf", target = "thumbv8m.main-none-eabihf",  features = [] },
+]
+
 [features]
 default = []
 std = ["futures/std", "time", "time-tick-1mhz", "embassy-macros/std"]
@@ -41,8 +55,8 @@ defmt = { version = "0.3", optional = true }
 log = { version = "0.4.14", optional = true }
 
 embedded-hal-02 = { package = "embedded-hal", version = "0.2.6" }
-embedded-hal-1 = { package = "embedded-hal", version = "1.0.0-alpha.6", git = "https://github.com/embassy-rs/embedded-hal", branch = "embassy", optional = true}
-embedded-hal-async = { version = "0.0.1", git = "https://github.com/embassy-rs/embedded-hal", branch = "embassy", optional = true}
+embedded-hal-1 = { package = "embedded-hal", version = "1.0.0-alpha.7", git = "https://github.com/embassy-rs/embedded-hal", branch = "embassy2", optional = true}
+embedded-hal-async = { version = "0.0.1", git = "https://github.com/embassy-rs/embedded-hal", branch = "embassy2", optional = true}
 
 futures     = { version = "0.3.17", default-features = false, features = [ "cfg-target-has-atomic", "unstable" ] }
 pin-project = { version = "1.0.8", default-features = false }

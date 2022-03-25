@@ -105,46 +105,41 @@ fn main() {
     // ========
     // Generate DMA IRQs.
 
-    let mut dma_irqs: HashSet<&str> = HashSet::new();
-    let mut bdma_irqs: HashSet<&str> = HashSet::new();
+    let mut dma_irqs: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
 
     for p in METADATA.peripherals {
         if let Some(r) = &p.registers {
-            match r.kind {
-                "dma" => {
-                    for irq in p.interrupts {
-                        dma_irqs.insert(irq.interrupt);
-                    }
+            if r.kind == "dma" || r.kind == "bdma" {
+                if p.name == "BDMA1" {
+                    // BDMA1 in H7 doesn't use DMAMUX, which breaks
+                    continue;
                 }
-                "bdma" => {
-                    for irq in p.interrupts {
-                        bdma_irqs.insert(irq.interrupt);
-                    }
+                for irq in p.interrupts {
+                    dma_irqs
+                        .entry(irq.interrupt)
+                        .or_default()
+                        .push((p.name, irq.signal));
                 }
-                _ => {}
             }
         }
     }
 
-    let tokens: Vec<_> = dma_irqs.iter().map(|s| format_ident!("{}", s)).collect();
-    g.extend(quote! {
-        #(
-            #[crate::interrupt]
-            unsafe fn #tokens () {
-                crate::dma::dma::on_irq();
-            }
-        )*
-    });
+    for (irq, channels) in dma_irqs {
+        let irq = format_ident!("{}", irq);
 
-    let tokens: Vec<_> = bdma_irqs.iter().map(|s| format_ident!("{}", s)).collect();
-    g.extend(quote! {
-        #(
+        let channels = channels
+            .iter()
+            .map(|(dma, ch)| format_ident!("{}_{}", dma, ch));
+
+        g.extend(quote! {
             #[crate::interrupt]
-            unsafe fn #tokens () {
-                crate::dma::bdma::on_irq();
+            unsafe fn #irq () {
+                #(
+                    <crate::peripherals::#channels as crate::dma::sealed::Channel>::on_irq();
+                )*
             }
-        )*
-    });
+        });
+    }
 
     // ========
     // Generate RccPeripheral impls
@@ -412,17 +407,17 @@ fn main() {
         (("timer", "BKIN2"), (quote!(crate::pwm::BreakInput2Pin), quote!())),
         (("timer", "BKIN2_COMP1"), (quote!(crate::pwm::BreakInput2Comparator1Pin), quote!())),
         (("timer", "BKIN2_COMP2"), (quote!(crate::pwm::BreakInput2Comparator2Pin), quote!())),
-        (("sdmmc", "CK"), (quote!(crate::sdmmc::CkPin), quote!(#[cfg(feature="sdmmc-rs")]))),
-        (("sdmmc", "CMD"), (quote!(crate::sdmmc::CmdPin), quote!(#[cfg(feature="sdmmc-rs")]))),
-        (("sdmmc", "D0"), (quote!(crate::sdmmc::D0Pin), quote!(#[cfg(feature="sdmmc-rs")]))),
-        (("sdmmc", "D1"), (quote!(crate::sdmmc::D1Pin), quote!(#[cfg(feature="sdmmc-rs")]))),
-        (("sdmmc", "D2"), (quote!(crate::sdmmc::D2Pin), quote!(#[cfg(feature="sdmmc-rs")]))),
-        (("sdmmc", "D3"), (quote!(crate::sdmmc::D3Pin), quote!(#[cfg(feature="sdmmc-rs")]))),
-        (("sdmmc", "D4"), (quote!(crate::sdmmc::D4Pin), quote!(#[cfg(feature="sdmmc-rs")]))),
-        (("sdmmc", "D5"), (quote!(crate::sdmmc::D5Pin), quote!(#[cfg(feature="sdmmc-rs")]))),
-        (("sdmmc", "D6"), (quote!(crate::sdmmc::D6Pin), quote!(#[cfg(feature="sdmmc-rs")]))),
-        (("sdmmc", "D6"), (quote!(crate::sdmmc::D7Pin), quote!(#[cfg(feature="sdmmc-rs")]))),
-        (("sdmmc", "D8"), (quote!(crate::sdmmc::D8Pin), quote!(#[cfg(feature="sdmmc-rs")]))),
+        (("sdmmc", "CK"), (quote!(crate::sdmmc::CkPin), quote!())),
+        (("sdmmc", "CMD"), (quote!(crate::sdmmc::CmdPin), quote!())),
+        (("sdmmc", "D0"), (quote!(crate::sdmmc::D0Pin), quote!())),
+        (("sdmmc", "D1"), (quote!(crate::sdmmc::D1Pin), quote!())),
+        (("sdmmc", "D2"), (quote!(crate::sdmmc::D2Pin), quote!())),
+        (("sdmmc", "D3"), (quote!(crate::sdmmc::D3Pin), quote!())),
+        (("sdmmc", "D4"), (quote!(crate::sdmmc::D4Pin), quote!())),
+        (("sdmmc", "D5"), (quote!(crate::sdmmc::D5Pin), quote!())),
+        (("sdmmc", "D6"), (quote!(crate::sdmmc::D6Pin), quote!())),
+        (("sdmmc", "D6"), (quote!(crate::sdmmc::D7Pin), quote!())),
+        (("sdmmc", "D8"), (quote!(crate::sdmmc::D8Pin), quote!())),
     ].into();
 
     for p in METADATA.peripherals {
@@ -488,6 +483,8 @@ fn main() {
         (("i2c", "TX"), quote!(crate::i2c::TxDma)),
         (("dcmi", "DCMI"), quote!(crate::dcmi::FrameDma)),
         (("dcmi", "PSSI"), quote!(crate::dcmi::FrameDma)),
+        // SDMMCv1 uses the same channel for both directions, so just implement for RX
+        (("sdmmc", "RX"), quote!(crate::sdmmc::SdmmcDma)),
     ]
     .into();
 
@@ -646,13 +643,13 @@ fn main() {
     make_table(&mut m, "foreach_dma_channel", &dma_channels_table);
 
     let out_dir = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let out_file = out_dir.join("macros.rs").to_string_lossy().to_string();
+    let out_file = out_dir.join("_macros.rs").to_string_lossy().to_string();
     fs::write(out_file, m).unwrap();
 
     // ========
     // Write generated.rs
 
-    let out_file = out_dir.join("generated.rs").to_string_lossy().to_string();
+    let out_file = out_dir.join("_generated.rs").to_string_lossy().to_string();
     fs::write(out_file, g.to_string()).unwrap();
 
     // ========
@@ -720,6 +717,8 @@ fn main() {
         Some("tim3") => println!("cargo:rustc-cfg=time_driver_tim3"),
         Some("tim4") => println!("cargo:rustc-cfg=time_driver_tim4"),
         Some("tim5") => println!("cargo:rustc-cfg=time_driver_tim5"),
+        Some("tim12") => println!("cargo:rustc-cfg=time_driver_tim12"),
+        Some("tim15") => println!("cargo:rustc-cfg=time_driver_tim15"),
         Some("any") => {
             if singletons.contains(&"TIM2".to_string()) {
                 println!("cargo:rustc-cfg=time_driver_tim2");
@@ -729,8 +728,12 @@ fn main() {
                 println!("cargo:rustc-cfg=time_driver_tim4");
             } else if singletons.contains(&"TIM5".to_string()) {
                 println!("cargo:rustc-cfg=time_driver_tim5");
+            } else if singletons.contains(&"TIM12".to_string()) {
+                println!("cargo:rustc-cfg=time_driver_tim12");
+            } else if singletons.contains(&"TIM15".to_string()) {
+                println!("cargo:rustc-cfg=time_driver_tim15");
             } else {
-                panic!("time-driver-any requested, but the chip doesn't have TIM2, TIM3, TIM4 or TIM5.")
+                panic!("time-driver-any requested, but the chip doesn't have TIM2, TIM3, TIM4, TIM5, TIM12 or TIM15.")
             }
         }
         _ => panic!("unknown time_driver {:?}", time_driver),
@@ -767,7 +770,7 @@ impl<T: Iterator> IteratorExt for T {
 fn make_table(out: &mut String, name: &str, data: &Vec<Vec<String>>) {
     write!(
         out,
-        "#[macro_export]
+        "#[allow(unused)]
 macro_rules! {} {{
     ($($pat:tt => $code:tt;)*) => {{
         macro_rules! __{}_inner {{

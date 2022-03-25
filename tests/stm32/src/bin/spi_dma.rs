@@ -22,11 +22,11 @@ async fn main(_spawner: Spawner, p: Peripherals) {
     #[cfg(feature = "stm32h755zi")]
     let (sck, mosi, miso, tx_dma, rx_dma) = (p.PA5, p.PB5, p.PA6, p.DMA1_CH0, p.DMA1_CH1);
     #[cfg(feature = "stm32g491re")]
-    let (sck, mosi, miso, tx_dma, rx_dma) = (p.PA5, p.PA7, p.PA6, p.DMA1_CH0, p.DMA1_CH1);
+    let (sck, mosi, miso, tx_dma, rx_dma) = (p.PA5, p.PA7, p.PA6, p.DMA1_CH1, p.DMA1_CH2);
     #[cfg(feature = "stm32g071rb")]
-    let (sck, mosi, miso, tx_dma, rx_dma) = (p.PA5, p.PA7, p.PA6, p.DMA1_CH0, p.DMA1_CH1);
+    let (sck, mosi, miso, tx_dma, rx_dma) = (p.PA5, p.PA7, p.PA6, p.DMA1_CH1, p.DMA1_CH2);
     #[cfg(feature = "stm32wb55rg")]
-    let (sck, mosi, miso, tx_dma, rx_dma) = (p.PA5, p.PA7, p.PA6, p.DMA1_CH0, p.DMA1_CH1);
+    let (sck, mosi, miso, tx_dma, rx_dma) = (p.PA5, p.PA7, p.PA6, p.DMA1_CH1, p.DMA1_CH2);
 
     let mut spi = Spi::new(
         p.SPI1,
@@ -46,6 +46,43 @@ async fn main(_spawner: Spawner, p: Peripherals) {
     let mut buf = [0; 9];
     spi.transfer(&mut buf, &data).await.unwrap();
     assert_eq!(buf, data);
+
+    spi.transfer_in_place(&mut buf).await.unwrap();
+    assert_eq!(buf, data);
+
+    // Check read/write don't hang. We can't check they transfer the right data
+    // without fancier test mechanisms.
+    spi.write(&buf).await.unwrap();
+    spi.read(&mut buf).await.unwrap();
+    spi.write(&buf).await.unwrap();
+    spi.read(&mut buf).await.unwrap();
+    spi.write(&buf).await.unwrap();
+
+    // Check transfer doesn't break after having done a write, due to garbage in the FIFO
+    spi.transfer(&mut buf, &data).await.unwrap();
+    assert_eq!(buf, data);
+
+    // Check zero-length operations, these should be noops.
+    spi.transfer::<u8>(&mut [], &[]).await.unwrap();
+    spi.transfer_in_place::<u8>(&mut []).await.unwrap();
+    spi.read::<u8>(&mut []).await.unwrap();
+    spi.write::<u8>(&[]).await.unwrap();
+
+    // === Check mixing blocking with async.
+    spi.blocking_transfer(&mut buf, &data).unwrap();
+    assert_eq!(buf, data);
+    spi.transfer(&mut buf, &data).await.unwrap();
+    assert_eq!(buf, data);
+    spi.blocking_write(&buf).unwrap();
+    spi.transfer(&mut buf, &data).await.unwrap();
+    assert_eq!(buf, data);
+    spi.blocking_read(&mut buf).unwrap();
+    spi.blocking_write(&buf).unwrap();
+    spi.write(&buf).await.unwrap();
+    spi.read(&mut buf).await.unwrap();
+    spi.blocking_write(&buf).unwrap();
+    spi.blocking_read(&mut buf).unwrap();
+    spi.write(&buf).await.unwrap();
 
     info!("Test OK");
     cortex_m::asm::bkpt();

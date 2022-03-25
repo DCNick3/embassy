@@ -64,7 +64,9 @@ pub enum Error {
     Overrun,
 }
 
-/// Interface to a TWIM instance.
+/// Interface to a TWIM instance using EasyDMA to offload the transmission and reception workload.
+///
+/// For more details about EasyDMA, consult the module documentation.
 pub struct Twim<'d, T: Instance> {
     phantom: PhantomData<&'d mut T>,
 }
@@ -287,7 +289,12 @@ impl<'d, T: Instance> Twim<'d, T> {
         })
     }
 
-    fn setup_write(&mut self, address: u8, buffer: &[u8], inten: bool) -> Result<(), Error> {
+    fn setup_write_from_ram(
+        &mut self,
+        address: u8,
+        buffer: &[u8],
+        inten: bool,
+    ) -> Result<(), Error> {
         let r = T::regs();
 
         compiler_fence(SeqCst);
@@ -342,7 +349,7 @@ impl<'d, T: Instance> Twim<'d, T> {
         Ok(())
     }
 
-    fn setup_write_read(
+    fn setup_write_read_from_ram(
         &mut self,
         address: u8,
         wr_buffer: &[u8],
@@ -382,12 +389,54 @@ impl<'d, T: Instance> Twim<'d, T> {
         Ok(())
     }
 
+    fn setup_write_read(
+        &mut self,
+        address: u8,
+        wr_buffer: &[u8],
+        rd_buffer: &mut [u8],
+        inten: bool,
+    ) -> Result<(), Error> {
+        match self.setup_write_read_from_ram(address, wr_buffer, rd_buffer, inten) {
+            Ok(_) => Ok(()),
+            Err(Error::DMABufferNotInDataMemory) => {
+                trace!("Copying TWIM tx buffer into RAM for DMA");
+                let tx_ram_buf = &mut [0; FORCE_COPY_BUFFER_SIZE][..wr_buffer.len()];
+                tx_ram_buf.copy_from_slice(wr_buffer);
+                self.setup_write_read_from_ram(address, &tx_ram_buf, rd_buffer, inten)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn setup_write(&mut self, address: u8, wr_buffer: &[u8], inten: bool) -> Result<(), Error> {
+        match self.setup_write_from_ram(address, wr_buffer, inten) {
+            Ok(_) => Ok(()),
+            Err(Error::DMABufferNotInDataMemory) => {
+                trace!("Copying TWIM tx buffer into RAM for DMA");
+                let tx_ram_buf = &mut [0; FORCE_COPY_BUFFER_SIZE][..wr_buffer.len()];
+                tx_ram_buf.copy_from_slice(wr_buffer);
+                self.setup_write_from_ram(address, &tx_ram_buf, inten)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Write to an I2C slave.
     ///
     /// The buffer must have a length of at most 255 bytes on the nRF52832
     /// and at most 65535 bytes on the nRF52840.
     pub fn blocking_write(&mut self, address: u8, buffer: &[u8]) -> Result<(), Error> {
         self.setup_write(address, buffer, false)?;
+        self.blocking_wait();
+        compiler_fence(SeqCst);
+        self.check_errorsrc()?;
+        self.check_tx(buffer.len())?;
+        Ok(())
+    }
+
+    /// Same as [`blocking_write`](Twim::blocking_write) but will fail instead of copying data into RAM. Consult the module level documentation to learn more.
+    pub fn blocking_write_from_ram(&mut self, address: u8, buffer: &[u8]) -> Result<(), Error> {
+        self.setup_write_from_ram(address, buffer, false)?;
         self.blocking_wait();
         compiler_fence(SeqCst);
         self.check_errorsrc()?;
@@ -428,45 +477,20 @@ impl<'d, T: Instance> Twim<'d, T> {
         Ok(())
     }
 
-    /// Copy data into RAM and write to an I2C slave.
-    ///
-    /// The write buffer must have a length of at most 255 bytes on the nRF52832
-    /// and at most 1024 bytes on the nRF52840.
-    pub fn blocking_copy_write(&mut self, address: u8, wr_buffer: &[u8]) -> Result<(), Error> {
-        if wr_buffer.len() > FORCE_COPY_BUFFER_SIZE {
-            return Err(Error::TxBufferTooLong);
-        }
-
-        // Copy to RAM
-        let wr_ram_buffer = &mut [0; FORCE_COPY_BUFFER_SIZE][..wr_buffer.len()];
-        wr_ram_buffer.copy_from_slice(wr_buffer);
-
-        self.blocking_write(address, wr_ram_buffer)
-    }
-
-    /// Copy data into RAM and write to an I2C slave, then read data from the slave without
-    /// triggering a stop condition between the two.
-    ///
-    /// The write buffer must have a length of at most 255 bytes on the nRF52832
-    /// and at most 1024 bytes on the nRF52840.
-    ///
-    /// The read buffer must have a length of at most 255 bytes on the nRF52832
-    /// and at most 65535 bytes on the nRF52840.
-    pub fn blocking_copy_write_read(
+    /// Same as [`blocking_write_read`](Twim::blocking_write_read) but will fail instead of copying data into RAM. Consult the module level documentation to learn more.
+    pub fn blocking_write_read_from_ram(
         &mut self,
         address: u8,
         wr_buffer: &[u8],
         rd_buffer: &mut [u8],
     ) -> Result<(), Error> {
-        if wr_buffer.len() > FORCE_COPY_BUFFER_SIZE {
-            return Err(Error::TxBufferTooLong);
-        }
-
-        // Copy to RAM
-        let wr_ram_buffer = &mut [0; FORCE_COPY_BUFFER_SIZE][..wr_buffer.len()];
-        wr_ram_buffer.copy_from_slice(wr_buffer);
-
-        self.blocking_write_read(address, wr_ram_buffer, rd_buffer)
+        self.setup_write_read_from_ram(address, wr_buffer, rd_buffer, false)?;
+        self.blocking_wait();
+        compiler_fence(SeqCst);
+        self.check_errorsrc()?;
+        self.check_tx(wr_buffer.len())?;
+        self.check_rx(rd_buffer.len())?;
+        Ok(())
     }
 
     pub async fn read(&mut self, address: u8, buffer: &mut [u8]) -> Result<(), Error> {
@@ -487,6 +511,16 @@ impl<'d, T: Instance> Twim<'d, T> {
         Ok(())
     }
 
+    /// Same as [`write`](Twim::write) but will fail instead of copying data into RAM. Consult the module level documentation to learn more.
+    pub async fn write_from_ram(&mut self, address: u8, buffer: &[u8]) -> Result<(), Error> {
+        self.setup_write_from_ram(address, buffer, true)?;
+        self.async_wait().await;
+        compiler_fence(SeqCst);
+        self.check_errorsrc()?;
+        self.check_tx(buffer.len())?;
+        Ok(())
+    }
+
     pub async fn write_read(
         &mut self,
         address: u8,
@@ -494,6 +528,22 @@ impl<'d, T: Instance> Twim<'d, T> {
         rd_buffer: &mut [u8],
     ) -> Result<(), Error> {
         self.setup_write_read(address, wr_buffer, rd_buffer, true)?;
+        self.async_wait().await;
+        compiler_fence(SeqCst);
+        self.check_errorsrc()?;
+        self.check_tx(wr_buffer.len())?;
+        self.check_rx(rd_buffer.len())?;
+        Ok(())
+    }
+
+    /// Same as [`write_read`](Twim::write_read) but will fail instead of copying data into RAM. Consult the module level documentation to learn more.
+    pub async fn write_read_from_ram(
+        &mut self,
+        address: u8,
+        wr_buffer: &[u8],
+        rd_buffer: &mut [u8],
+    ) -> Result<(), Error> {
+        self.setup_write_read_from_ram(address, wr_buffer, rd_buffer, true)?;
         self.async_wait().await;
         compiler_fence(SeqCst);
         self.check_errorsrc()?;
@@ -601,11 +651,7 @@ mod eh02 {
             bytes: &'w [u8],
             buffer: &'w mut [u8],
         ) -> Result<(), Error> {
-            if slice_in_ram(bytes) {
-                self.blocking_write_read(addr, bytes, buffer)
-            } else {
-                self.blocking_copy_write_read(addr, bytes, buffer)
-            }
+            self.blocking_write_read(addr, bytes, buffer)
         }
     }
 }
@@ -697,52 +743,43 @@ mod eh1 {
     }
 }
 
-#[cfg(all(feature = "unstable-traits", feature = "nightly"))]
-impl<'d, T: Instance> embedded_hal_async::i2c::I2c for Twim<'d, T> {
-    type ReadFuture<'a>
-    where
-        Self: 'a,
-    = impl Future<Output = Result<(), Self::Error>> + 'a;
+cfg_if::cfg_if! {
+    if #[cfg(all(feature = "unstable-traits", feature = "nightly"))] {
+        impl<'d, T: Instance> embedded_hal_async::i2c::I2c for Twim<'d, T> {
+            type ReadFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
 
-    fn read<'a>(&'a mut self, address: u8, buffer: &'a mut [u8]) -> Self::ReadFuture<'a> {
-        self.read(address, buffer)
-    }
+            fn read<'a>(&'a mut self, address: u8, buffer: &'a mut [u8]) -> Self::ReadFuture<'a> {
+                self.read(address, buffer)
+            }
 
-    type WriteFuture<'a>
-    where
-        Self: 'a,
-    = impl Future<Output = Result<(), Self::Error>> + 'a;
+            type WriteFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
 
-    fn write<'a>(&'a mut self, address: u8, bytes: &'a [u8]) -> Self::WriteFuture<'a> {
-        self.write(address, bytes)
-    }
+            fn write<'a>(&'a mut self, address: u8, bytes: &'a [u8]) -> Self::WriteFuture<'a> {
+                self.write(address, bytes)
+            }
 
-    type WriteReadFuture<'a>
-    where
-        Self: 'a,
-    = impl Future<Output = Result<(), Self::Error>> + 'a;
+            type WriteReadFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
 
-    fn write_read<'a>(
-        &'a mut self,
-        address: u8,
-        wr_buffer: &'a [u8],
-        rd_buffer: &'a mut [u8],
-    ) -> Self::WriteReadFuture<'a> {
-        self.write_read(address, wr_buffer, rd_buffer)
-    }
+            fn write_read<'a>(
+                &'a mut self,
+                address: u8,
+                wr_buffer: &'a [u8],
+                rd_buffer: &'a mut [u8],
+            ) -> Self::WriteReadFuture<'a> {
+                self.write_read(address, wr_buffer, rd_buffer)
+            }
 
-    type TransactionFuture<'a>
-    where
-        Self: 'a,
-    = impl Future<Output = Result<(), Self::Error>> + 'a;
+            type TransactionFuture<'a, 'b> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a, 'b: 'a;
 
-    fn transaction<'a>(
-        &'a mut self,
-        address: u8,
-        operations: &mut [embedded_hal_async::i2c::Operation<'a>],
-    ) -> Self::TransactionFuture<'a> {
-        let _ = address;
-        let _ = operations;
-        async move { todo!() }
+            fn transaction<'a, 'b>(
+                &'a mut self,
+                address: u8,
+                operations: &'a mut [embedded_hal_async::i2c::Operation<'b>],
+            ) -> Self::TransactionFuture<'a, 'b> {
+                let _ = address;
+                let _ = operations;
+                async move { todo!() }
+            }
+        }
     }
 }
